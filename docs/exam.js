@@ -171,36 +171,7 @@ function layoutItem(it) {
 
   // choices
   it.choices.forEach((c) => {
-    const el = document.createElement("div");
-    el.className = "choice";
-    el.dataset.letter = c.letter;
-    el.style.left = (c.row[0] * w) + "px";
-    el.style.top = (c.row[1] * h) + "px";
-    el.style.width = ((c.row[2] - c.row[0]) * w) + "px";
-    el.style.height = ((c.row[3] - c.row[1]) * h) + "px";
-    const rad = document.createElement("div");
-    rad.className = "radio";
-    const rr = c.radio[2] * h;
-    rad.style.width = rad.style.height = (rr * 1.05) + "px";
-    rad.style.left = (c.radio[0] * w - rr * 0.52 - c.row[0] * w) + "px";
-    rad.style.top = (c.radio[1] * h - rr * 0.52 - c.row[1] * h) + "px";
-    el.appendChild(rad);
-    const st = document.createElement("div");
-    st.className = "strike";
-    // through the vertical center of the option text (= radio center), from
-    // just past the radio to the end of the option's words
-    st.style.top = ((c.radio[1] - c.row[1]) * h - 1) + "px";
-    const rowWords = it.words.filter((wd) => {
-      const cy = (wd[1] + wd[3]) / 2;
-      return cy >= c.row[1] && cy <= c.row[3];
-    });
-    if (rowWords.length) {
-      const leftPx = (c.radio[0] * w + c.radio[2] * h * 1.6) - c.row[0] * w;
-      const endPx = Math.max(...rowWords.map((wd) => wd[2])) * w - c.row[0] * w;
-      st.style.left = leftPx + "px";
-      st.style.width = Math.max(20, endPx - leftPx + 4) + "px";
-    }
-    el.appendChild(st);
+    const el = makeChoiceEl(it, c, w, h);
     if (S.answers[it.item] === c.letter) el.classList.add("sel");
     if (S.struck[it.item] && S.struck[it.item][c.letter]) el.classList.add("struck");
     ov.appendChild(el);
@@ -208,6 +179,42 @@ function layoutItem(it) {
 
   buildTextLayer(it, w, h);
   drawHighlights(it);
+}
+
+/* Positioned choice-row element (radio + strike line), shared by the exam
+   view and the review view. */
+function makeChoiceEl(it, c, w, h) {
+  const el = document.createElement("div");
+  el.className = "choice";
+  el.dataset.letter = c.letter;
+  el.style.left = (c.row[0] * w) + "px";
+  el.style.top = (c.row[1] * h) + "px";
+  el.style.width = ((c.row[2] - c.row[0]) * w) + "px";
+  el.style.height = ((c.row[3] - c.row[1]) * h) + "px";
+  const rad = document.createElement("div");
+  rad.className = "radio";
+  const rr = c.radio[2] * h;
+  rad.style.width = rad.style.height = (rr * 1.05) + "px";
+  rad.style.left = (c.radio[0] * w - rr * 0.52 - c.row[0] * w) + "px";
+  rad.style.top = (c.radio[1] * h - rr * 0.52 - c.row[1] * h) + "px";
+  el.appendChild(rad);
+  const st = document.createElement("div");
+  st.className = "strike";
+  // through the vertical center of the option text (= radio center), from
+  // just past the radio to the end of the option's words
+  st.style.top = ((c.radio[1] - c.row[1]) * h - 1) + "px";
+  const rowWords = it.words.filter((wd) => {
+    const cy = (wd[1] + wd[3]) / 2;
+    return cy >= c.row[1] && cy <= c.row[3];
+  });
+  if (rowWords.length) {
+    const leftPx = (c.radio[0] * w + c.radio[2] * h * 1.6) - c.row[0] * w;
+    const endPx = Math.max(...rowWords.map((wd) => wd[2])) * w - c.row[0] * w;
+    st.style.left = leftPx + "px";
+    st.style.width = Math.max(20, endPx - leftPx + 4) + "px";
+  }
+  el.appendChild(st);
+  return el;
 }
 
 /* Cluster words (already in reading order) into visual lines so every span
@@ -445,6 +452,20 @@ function wireChrome() {
   $("confirmEnd").onclick = () => { closeModal(); submitExam(); };
   $("exitReview").onclick = () => exitReview();
   $("newExam").onclick = () => { location.reload(); };
+  $("origBtn").onclick = async () => {
+    const img = $("reviewimg");
+    if (img.style.display === "none") {
+      const url = await DATA.answerURL(cur);
+      if (url) {
+        img.src = url;
+        img.style.display = "block";
+        $("origBtn").textContent = "Hide original answer-key page";
+      }
+    } else {
+      img.style.display = "none";
+      $("origBtn").textContent = "Show original answer-key page";
+    }
+  };
 
   // overlay interactions: native selection does the dragging; we only need
   // click-vs-selection disambiguation on mouseup.
@@ -487,11 +508,14 @@ function wireChrome() {
     }
   });
 
-  // keep overlay aligned on resize
+  // keep overlays aligned on resize
   let rt = null;
   window.addEventListener("resize", () => {
     clearTimeout(rt);
-    rt = setTimeout(() => { if (!reviewing) layoutItem(item(cur)); }, 120);
+    rt = setTimeout(() => {
+      if (reviewing) layoutReview(item(cur));
+      else layoutItem(item(cur));
+    }, 120);
   });
 }
 
@@ -654,20 +678,26 @@ async function showReview(i) {
   const strip = $("resultstrip");
   const img = $("reviewimg");
   const na = $("naNote");
+  const rstage = $("rstage");
+  const expl = $("expl");
+  const origWrap = $("origWrap");
   const your = S.answers[it.item];
+
+  img.style.display = "none";
+  expl.style.display = "none";
+  origWrap.style.display = "none";
 
   if (!it.answer_available) {
     strip.className = "resultstrip na";
     strip.innerHTML = `<b>Item ${it.item}</b> <span class="pill">Your answer: ${your || "—"}</span>` +
       `<span class="pill">Not in answer key</span>`;
-    img.style.display = "none";
+    rstage.style.display = "none";
     na.style.display = "block";
     na.innerHTML = `The answer-key PDF did not include item ${it.item}, so it can't be shown here ` +
       `and wasn't counted in your score.`;
     return;
   }
   na.style.display = "none";
-  img.style.display = "block";
   const isCorrect = your && your === it.correct;
   strip.className = "resultstrip " + (isCorrect ? "correct" : (your ? "wrong" : "skipped"));
   strip.innerHTML =
@@ -675,10 +705,110 @@ async function showReview(i) {
     `<span class="pill">Your answer: <b>${your || "— (blank)"}</b></span>` +
     `<span class="pill">Correct: <b>${it.correct}</b></span>` +
     `<span>${isCorrect ? "✓ Correct" : (your ? "✗ Incorrect" : "○ Skipped")}</span>`;
-  img.onload = () => { $("reviewwrap").scrollTop = 0; };
+
+  // the question as YOU left it: your pick, strikes, highlights — plus
+  // right/wrong markers
+  rstage.style.display = "block";
+  const rimg = $("rimg");
+  rimg.onload = () => layoutReview(it);
+  rimg.src = DATA.qURLs[cur];
+  if (rimg.complete && rimg.naturalWidth) layoutReview(it);
+  $("reviewwrap").scrollTop = 0;
+
+  // explanation as clean text; fall back to the answer-page image
   const requested = cur;
-  const url = await DATA.answerURL(cur);
-  if (cur === requested && url) img.src = url;
+  const info = await DATA.answerInfo(cur);
+  if (cur !== requested || !reviewing) return;
+  if (info) {
+    expl.innerHTML = renderExplanation(info);
+    expl.style.display = "block";
+    origWrap.style.display = "block";
+    $("origBtn").textContent = "Show original answer-key page";
+  } else {
+    const url = await DATA.answerURL(cur);
+    if (cur !== requested || !reviewing) return;
+    if (url) { img.src = url; img.style.display = "block"; }
+  }
+}
+
+function layoutReview(it) {
+  const img = $("rimg");
+  const w = img.clientWidth, h = img.clientHeight;
+  const ov = $("roverlay");
+  ov.style.width = w + "px";
+  ov.style.height = h + "px";
+  ov.innerHTML = "";
+  const your = S.answers[it.item];
+
+  it.choices.forEach((c) => {
+    const el = makeChoiceEl(it, c, w, h);
+    const isPick = your === c.letter;
+    const isKey = c.letter === it.correct;
+    if (isPick) el.classList.add("sel");
+    if (S.struck[it.item] && S.struck[it.item][c.letter]) el.classList.add("struck");
+    if (isKey) el.classList.add("correct");
+    if (isPick && !isKey) el.classList.add("wrongpick");
+    ov.appendChild(el);
+    if (isKey || (isPick && !isKey)) {
+      const mk = document.createElement("div");
+      mk.className = "rmark";
+      const r = c.radio[2] * h;
+      mk.appendChild(markSvg(isKey ? "good" : "bad", r * 2.6));
+      mk.style.left = (c.radio[0] * w - r * 4.2) + "px";
+      mk.style.top = (c.radio[1] * h) + "px";
+      ov.appendChild(mk);
+    }
+  });
+
+  // clip the card just below the content so the explanation sits right
+  // under the choices instead of after a page of white space
+  const lastChoice = it.choices.length
+    ? Math.max(...it.choices.map((c) => c.row[3])) : 1;
+  const lastWord = it.words.length
+    ? Math.max(...it.words.map((wd) => wd[3])) : 1;
+  $("rstage").style.height =
+    Math.min(h, Math.max(lastChoice, lastWord) * h + 16) + "px";
+
+  (S.highlights[it.item] || []).forEach((rct) => {
+    const el = document.createElement("div");
+    el.className = "hl static";
+    el.style.left = (rct[0] * w) + "px";
+    el.style.top = (rct[1] * h) + "px";
+    el.style.width = ((rct[2] - rct[0]) * w) + "px";
+    el.style.height = ((rct[3] - rct[1]) * h) + "px";
+    ov.appendChild(el);
+  });
+}
+
+/* Crisp SVG check / X marks in NBME's review colors. */
+function markSvg(kind, size) {
+  const NS = "http://www.w3.org/2000/svg";
+  const s = document.createElementNS(NS, "svg");
+  s.setAttribute("viewBox", "0 0 24 24");
+  s.style.width = s.style.height = size + "px";
+  s.style.display = "block";
+  const p = document.createElementNS(NS, "path");
+  p.setAttribute("d", kind === "good"
+    ? "M3.5 13.5 L9.5 19.5 L20.5 5"
+    : "M5 5 L19 19 M19 5 L5 19");
+  p.setAttribute("fill", "none");
+  p.setAttribute("stroke", kind === "good" ? "#2e7d32" : "#c62828");
+  p.setAttribute("stroke-width", "3.6");
+  p.setAttribute("stroke-linecap", "round");
+  s.appendChild(p);
+  return s;
+}
+
+function escHtml(s) {
+  return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+function renderExplanation(info) {
+  return info.paragraphs.map((p) => {
+    let html = escHtml(p);
+    if (/^Correct Answer\s*:/.test(p)) return `<p class="ans-correct">${html}</p>`;
+    html = html.replace(/^(Incorrect Answers:|Educational Objective:)/, "<b>$1</b>");
+    return `<p>${html}</p>`;
+  }).join("");
 }
 
 function exitReview() {

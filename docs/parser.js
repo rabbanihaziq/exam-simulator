@@ -114,24 +114,28 @@ function radioForLetter(data, w, h, box) {
 
 /* ---------------- PDF.js text extraction -------------------------------- */
 
-/* Reconstruct page text with line breaks (roughly what fitz get_text gives),
-   so the item-number / correct-answer / stem regexes work. */
-async function getPageText(page) {
+/* Reconstruct a page's text lines (top first), keeping each line's baseline
+   y so callers can detect paragraph breaks from vertical spacing.
+   foldSubscripts widens baseline merging so sub/superscripts (e.g. the 4 in
+   T4, offset ~0.4em) join their line — only safe on well-spaced body text,
+   not on dense tables, so it's opt-in (used for explanation extraction). */
+async function getPageLines(page, foldSubscripts) {
   const tc = await page.getTextContent();
   const rows = new Map();  // rounded baseline y -> [{x, w, str}]
   for (const it of tc.items) {
     if (!it.str || !it.str.trim()) continue;
     const y = Math.round(it.transform[5]);
     let row = null;
-    for (const key of rows.keys()) {         // merge near-identical baselines
-      if (Math.abs(key - y) <= 2) { row = key; break; }
+    const tol = foldSubscripts ? Math.max(4, (it.height || 10) * 0.45) : 2;
+    for (const key of rows.keys()) {
+      if (Math.abs(key - y) <= tol) { row = key; break; }
     }
     if (row === null) { rows.set(y, []); row = y; }
     rows.get(row).push({ x: it.transform[4], w: it.width,
                          h: it.height || 10, str: it.str });
   }
   const ordered = [...rows.entries()].sort((a, b) => b[0] - a[0]); // top first
-  return ordered.map(([, items]) => {
+  return ordered.map(([y, items]) => {
     items.sort((a, b) => a.x - b.x);
     // gap-aware join: PDFs split words into glyph runs; only insert a space
     // when there's a real horizontal gap between adjacent items
@@ -141,8 +145,12 @@ async function getPageText(page) {
       line += i.str;
       endX = i.x + i.w;
     }
-    return line;
-  }).join("\n");
+    return { y, text: line };
+  });
+}
+
+async function getPageText(page) {
+  return (await getPageLines(page)).map((l) => l.text).join("\n");
 }
 
 /* Extract positioned words from a page, in canvas pixel coords. */
@@ -330,7 +338,55 @@ async function parseExam(qBytes, aBytes, onProgress) {
     return url;
   }
 
-  return { count: items.length, title, items, qURLs, answerURL };
+  /* -- lazy answer-explanation text extraction --
+     Returns { paragraphs: [string] } starting at "Correct Answer: X", grouped
+     into paragraphs by the page's vertical line spacing, or null when the
+     text is too thin to trust (caller falls back to the page image). */
+  const aInfoCache = new Map();
+  async function answerInfo(idx0) {
+    const it = items[idx0];
+    if (it.a_page === null) return null;
+    if (aInfoCache.has(it.a_page)) return aInfoCache.get(it.a_page);
+    let info = null;
+    try {
+      const lines = await getPageLines(await adoc.getPage(it.a_page), true);
+      const start = lines.findIndex((l) => /Correct\s*Answer\s*:/.test(l.text));
+      if (start >= 0) {
+        const CHROME = /Time Remaining|Exam Section|^\s*(Previous|Next|Highlight|Lab Values|Calculator|Navigator|End Block|Mark)\b/;
+        const body = lines.slice(start)
+          .filter((l) => l.text.trim() && !CHROME.test(l.text));
+        const gaps = [];
+        for (let i = 1; i < body.length; i++) {
+          gaps.push(Math.abs(body[i - 1].y - body[i].y));
+        }
+        gaps.sort((a, b) => a - b);
+        const med = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 14;
+        const paras = [];
+        let cur = null;
+        body.forEach((l, i) => {
+          const gap = i ? Math.abs(body[i - 1].y - l.y) : 0;
+          const forceNew = /^(Incorrect Answers|Educational Objective)/.test(l.text.trim());
+          if (!cur || forceNew || gap > med * 1.55) { cur = []; paras.push(cur); }
+          cur.push(l.text.trim());
+        });
+        const texts = paras.map((p) => p.join(" ").replace(/\s+/g, " ")
+          // folded subscripts can swallow the following space: "T4or" -> "T4 or"
+          .replace(/([A-Z]\d{1,2})([a-z]{2,})/g, "$1 $2").trim())
+          .filter(Boolean)
+          // drop watermark/junk paragraphs (URLs, mostly-symbol noise)
+          .filter((p) => !/https?:\/\/|t\.me\/|www\./i.test(p))
+          .filter((p) => {
+            const letters = (p.match(/[A-Za-z]/g) || []).length;
+            return letters / p.length > 0.5;
+          });
+        if (texts.join(" ").length >= 200) info = { paragraphs: texts };
+      }
+    } catch (e) { info = null; }
+    aInfoCache.set(it.a_page, info);
+    return info;
+  }
+
+  return { count: items.length, title, items, qURLs, answerURL, answerInfo };
 }
 
 window.parseExam = parseExam;

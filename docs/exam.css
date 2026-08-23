@@ -146,6 +146,27 @@ table.lab tr.hide{display:none;}
 .confirm-text{padding:18px 20px;font-size:14.5px;line-height:1.6;color:#2a3947;max-width:420px;}
 
 /* ---------- review ---------- */
+#rstage{position:relative;margin:14px auto 0;width:100%;max-width:1180px;background:#fff;
+  border:1px solid #e2e8ef;border-radius:8px;overflow:hidden;}
+#rimg{display:block;width:100%;height:auto;}
+#roverlay{position:absolute;inset:0;}
+#roverlay .choice,#roverlay .hl.static{pointer-events:none;}
+.choice.correct{background:rgba(46,125,50,.10);}
+.choice.sel.correct .radio{background:#2e7d32;box-shadow:0 0 0 2px #fff,0 0 0 3px #2e7d32;}
+.choice.wrongpick{background:rgba(163,51,51,.10);}
+.choice.wrongpick .radio{background:#a33;box-shadow:0 0 0 2px #fff,0 0 0 3px #a33;}
+.rmark{position:absolute;transform:translate(-50%,-50%);line-height:0;}
+#roverlay .radio{box-shadow:none;}
+.expl{max-width:1180px;margin:18px auto 8px;padding:22px 28px;background:#fff;
+  border:1px solid #e2e8ef;border-radius:10px;font-size:15px;line-height:1.7;color:#20303f;}
+.expl p{margin:0 0 14px;}
+.expl p:last-child{margin-bottom:0;}
+.expl .ans-correct{font-weight:800;color:#1c6b2d;font-size:16.5px;}
+#origWrap{max-width:1180px;margin:4px auto 20px;text-align:center;}
+#origBtn{background:#eef1f5;border:1px solid #cdd7e2;border-radius:7px;padding:8px 14px;
+  font-size:13px;color:#33475c;cursor:pointer;}
+#origBtn:hover{background:#e2e8f0;}
+
 #reviewbar{height:auto;min-height:46px;flex:none;background:#12335c;color:#fff;
   display:flex;align-items:center;gap:18px;padding:8px 16px;flex-wrap:wrap;}
 #reviewbar .score{font-size:20px;font-weight:800;}

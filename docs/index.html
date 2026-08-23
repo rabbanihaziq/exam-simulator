@@ -72,11 +72,11 @@
       <div class="row">
         <div class="minutes">
           <label class="f" style="margin-top:0">Time limit (min)</label>
-          <input type="number" id="minutes" value="60" min="0" max="600">
+          <input type="number" id="minutes" value="75" min="0" max="600">
         </div>
         <div class="hint" style="flex:1;padding-bottom:10px">
-          Set to <b>0</b> for an untimed session. The timer counts down and turns red near the end,
-          but never forces a submit.
+          Default is real-exam pacing (90 sec/question). Set to <b>0</b> for an untimed
+          session. The timer turns red near the end but never forces a submit.
         </div>
       </div>
 
@@ -133,7 +133,15 @@
 
   <div id="reviewwrap" style="display:none">
     <div class="resultstrip" id="resultstrip"></div>
-    <img id="reviewimg" alt="answer">
+    <div id="rstage">
+      <img id="rimg" alt="question">
+      <div id="roverlay"></div>
+    </div>
+    <div class="expl" id="expl" style="display:none"></div>
+    <div id="origWrap" style="display:none">
+      <button id="origBtn">Show original answer-key page</button>
+    </div>
+    <img id="reviewimg" alt="answer" style="display:none">
     <div class="na-note" id="naNote" style="display:none"></div>
   </div>
 

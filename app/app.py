@@ -67,9 +67,9 @@ def start():
         return render_template("index.html",
                                error="Please choose both a questions PDF and an answer-key PDF."), 400
     try:
-        duration = int(request.form.get("minutes", "60"))
+        duration = int(request.form.get("minutes", "75"))
     except ValueError:
-        duration = 60
+        duration = 75
     duration = max(0, min(duration, 600))
 
     token = secrets.token_hex(8)
@@ -109,7 +109,7 @@ def api_exam():
         return jsonify({"error": "no exam"}), 404
     data = parser.to_dict()
     token = session.get("exam")
-    data["minutes"] = _META.get(token, {}).get("minutes", 60)
+    data["minutes"] = _META.get(token, {}).get("minutes", 75)
     data["sid"] = token  # per-exam id so the client keeps separate saved state
     return jsonify(data)
 
