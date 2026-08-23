@@ -153,12 +153,13 @@ async function getPageText(page) {
   return (await getPageLines(page)).map((l) => l.text).join("\n");
 }
 
-/* Render with a stall watchdog: PDF.js renders of these very large pages
-   occasionally never resolve (lost worker message); cancelling and retrying
-   reliably unsticks them. */
+/* Render with print intent — the default display intent schedules paint
+   continuations on requestAnimationFrame, which never fires in a
+   backgrounded tab, silently stalling the parse. Plus a watchdog that
+   cancels and retries a render that still won't resolve. */
 async function renderPage(page, viewport, ctx) {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const task = page.render({ canvasContext: ctx, viewport });
+    const task = page.render({ canvasContext: ctx, viewport, intent: "print" });
     const result = await Promise.race([
       task.promise.then(() => "ok").catch(() => "cancelled"),
       new Promise((res) => setTimeout(() => res("timeout"), 7000)),
