@@ -153,39 +153,300 @@ async function getPageText(page) {
   return (await getPageLines(page)).map((l) => l.text).join("\n");
 }
 
-/* Extract positioned words from a page, in canvas pixel coords. */
+/* Extract positioned words from a page, in canvas pixel coords, with font
+   style flags (italic/bold) resolved from the page's loaded fonts. Must be
+   called after the page has been rendered so commonObjs is populated. */
 async function getPageWords(page, viewport) {
   const tc = await page.getTextContent();
   const U = window.pdfjsLib.Util;
+  const fcache = {};
+  function fontFlags(fname) {
+    if (!(fname in fcache)) {
+      let n = "";
+      try {
+        const f = page.commonObjs.get(fname);
+        n = (f && (f.name || f.loadedName)) || "";
+      } catch (e) { n = ""; }
+      fcache[fname] = { it: /italic|oblique/i.test(n), bd: /bold|black|heavy/i.test(n) };
+    }
+    return fcache[fname];
+  }
   const raw = [];
+  const itemRects = [];   // exact per-text-item boxes (no per-word estimation)
   for (const it of tc.items) {
     if (!it.str || !it.str.trim()) continue;
     const m = U.transform(viewport.transform, it.transform);
     const x = m[4], yBase = m[5];
     const fh = Math.hypot(m[2], m[3]);            // scaled font size
     const wpx = it.width * viewport.scale;
+    itemRects.push([x, yBase - fh, x + wpx, yBase + fh * 0.25]);
     const str = it.str;
+    const fl = fontFlags(it.fontName);
     for (const match of str.matchAll(/\S+/g)) {
       const f0 = match.index / str.length;
       const f1 = (match.index + match[0].length) / str.length;
       raw.push({
         x0: x + wpx * f0, x1: x + wpx * f1,
         y0: yBase - fh, y1: yBase + fh * 0.25,
-        base: yBase, text: match[0],
+        base: yBase, text: match[0], it: fl.it, bd: fl.bd,
       });
     }
   }
   // reading order: by baseline, then x
   raw.sort((a, b) => (Math.round(a.base) - Math.round(b.base)) || (a.x0 - b.x0));
+  raw.itemRects = itemRects;
   return raw;
+}
+
+/* ---------------- structured (real-text) question extraction ------------ */
+
+function median(a) {
+  if (!a.length) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  return s[Math.floor(s.length / 2)];
+}
+
+/* Cluster words into visual lines; fold sub/superscript fragments (smaller
+   font, offset baseline) into their parent line with a sub/sup flag. */
+function clusterTextLines(ws) {
+  const sorted = [...ws].sort((a, b) => a.base - b.base || a.x0 - b.x0);
+  const lines = [];
+  for (const w of sorted) {
+    const L = lines[lines.length - 1];
+    if (L && Math.abs(w.base - L.base) <= 5) L.words.push(w);
+    else lines.push({ base: w.base, words: [w] });
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const L = lines[i];
+    const h = median(L.words.map((w) => w.y1 - w.y0));
+    for (const N of [lines[i - 1], lines[i + 1]]) {
+      if (!N) continue;
+      const nh = median(N.words.map((w) => w.y1 - w.y0));
+      if (h < nh * 0.8 && Math.abs(L.base - N.base) < nh * 0.75) {
+        const flag = L.base > N.base ? "sub" : "sup";
+        L.words.forEach((w) => { w[flag] = true; });
+        N.words.push(...L.words);
+        lines.splice(i, 1);
+        break;
+      }
+    }
+  }
+  lines.forEach((L) => {
+    L.words.sort((a, b) => a.x0 - b.x0);
+    L.x0 = Math.min(...L.words.map((w) => w.x0));
+    L.x1 = Math.max(...L.words.map((w) => w.x1));
+    L.y0 = Math.min(...L.words.map((w) => w.y0));
+    L.y1 = Math.max(...L.words.map((w) => w.y1));
+  });
+  return lines;
+}
+
+/* Non-text ink (photos, charts, table borders) found by scanning the
+   rendered page for pixels outside every text-item box. Needed because some
+   share-PDFs are full-page screenshots (one big image op), so the operator
+   list can't localize the figures inside them. */
+function inkFigures(imgData, top, stemBot, textRects) {
+  const data = imgData.data, W = imgData.width;
+  // page-chrome artifacts live at the extreme edges (border strips, the
+  // rendered scrollbar on the right) — exclude the outer margins
+  const xMin = Math.ceil(W * 0.012), xMax = Math.floor(W * 0.97);
+  const bands = [];
+  let cur = null;
+  for (let y = Math.ceil(top); y < Math.floor(stemBot); y += 2) {
+    const iv = [];
+    for (const r of textRects) if (y >= r[1] && y <= r[3]) iv.push([r[0], r[2]]);
+    iv.sort((a, b) => a[0] - b[0]);
+    let cnt = 0, x0 = Infinity, x1 = -1, k = 0;
+    for (let x = xMin; x < xMax; x += 2) {
+      while (k < iv.length && x > iv[k][1]) k++;
+      if (k < iv.length && x >= iv[k][0]) continue;
+      const idx = (y * W + x) * 4;
+      const d = Math.max(255 - data[idx], 255 - data[idx + 1], 255 - data[idx + 2]);
+      if (d > 40) { cnt++; if (x < x0) x0 = x; if (x > x1) x1 = x; }
+    }
+    if (cnt >= 3) {
+      if (cur && y - cur.y1 <= 12) {
+        cur.y1 = y;
+        cur.x0 = Math.min(cur.x0, x0);
+        cur.x1 = Math.max(cur.x1, x1);
+      } else {
+        cur = { y0: y, y1: y, x0, x1 };
+        bands.push(cur);
+      }
+    }
+  }
+  return bands.filter((b) => b.y1 - b.y0 >= 10 && b.x1 - b.x0 >= 10);
+}
+
+function cropBlob(canvas, x0, y0, x1, y1) {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(x1 - x0));
+  c.height = Math.max(1, Math.round(y1 - y0));
+  c.getContext("2d").drawImage(canvas, -Math.round(x0), -Math.round(y0));
+  return new Promise((res) => c.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
+}
+
+function wordRun(w, wid) {
+  const r = { text: w.text, wid };
+  if (w.it) r.i = 1;
+  if (w.bd) r.b = 1;
+  if (w.sub) r.sub = 1;
+  if (w.sup) r.sup = 1;
+  return r;
+}
+
+/* Build the structured content for one question page: stem paragraphs with
+   inline figure crops, plus per-choice text runs. Returns null when the page
+   doesn't extract cleanly (caller falls back to image mode). */
+async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
+  if (!pxChoices.length) return null;
+  const stemBot = pxChoices[0].rowTop;
+  const stemWords = raw.filter((w) => w.y0 >= top - 2 && w.y1 <= stemBot + 2);
+  if (stemWords.length < 5) return null;
+
+  // ---- figures first (column-aware): ink regions outside every text box --
+  const textRects = (raw.itemRects || [])
+    .map((r) => [r[0] - 4, r[1] - 4, r[2] + 4, r[3] + 4]);
+  let figs = inkFigures(imgData, top, stemBot, textRects);
+  function mergeFigs() {
+    let merged = true;
+    while (merged) {
+      merged = false;
+      outer:
+      for (let i = 0; i < figs.length; i++) {
+        for (let j = i + 1; j < figs.length; j++) {
+          if (figs[i].y0 <= figs[j].y1 + 8 && figs[j].y0 <= figs[i].y1 + 8 &&
+              figs[i].x0 <= figs[j].x1 + 40 && figs[j].x0 <= figs[i].x1 + 40) {
+            figs[i] = {
+              y0: Math.min(figs[i].y0, figs[j].y0), y1: Math.max(figs[i].y1, figs[j].y1),
+              x0: Math.min(figs[i].x0, figs[j].x0), x1: Math.max(figs[i].x1, figs[j].x1),
+            };
+            figs.splice(j, 1);
+            merged = true;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  mergeFigs();
+
+  // words that live inside/near a figure region are part of it (chart titles,
+  // axis labels, values inside a diagram) — absorb them so side-by-side
+  // column layouts don't corrupt the body-text lines
+  const bodyWords = [];
+  for (const w of stemWords) {
+    const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
+    const f = figs.find((f) => cx > f.x0 - 24 && cx < f.x1 + 24 &&
+                               cy > f.y0 - 110 && cy < f.y1 + 70);
+    if (f) {
+      f.x0 = Math.min(f.x0, w.x0 - 4); f.x1 = Math.max(f.x1, w.x1 + 4);
+      f.y0 = Math.min(f.y0, w.y0 - 4); f.y1 = Math.max(f.y1, w.y1 + 4);
+    } else bodyWords.push(w);
+  }
+  mergeFigs();
+  if (bodyWords.length < 5) return null;
+
+  // ---- body text: lines -> paragraphs ------------------------------------
+  const lines = clusterTextLines(bodyWords);
+  const deltas = [];
+  for (let i = 1; i < lines.length; i++) {
+    const d = lines[i].base - lines[i - 1].base;
+    if (d > 2) deltas.push(d);
+  }
+  const med = median(deltas) || 26;
+  const paras = [];
+  let curP = null;
+  lines.forEach((L, i) => {
+    const gap = i ? L.base - lines[i - 1].base : 0;
+    if (!curP || gap > med * 1.55) { curP = { lines: [] }; paras.push(curP); }
+    curP.lines.push(L);
+  });
+  paras.forEach((p) => {
+    p.y0 = Math.min(...p.lines.map((l) => l.y0));
+    p.y1 = Math.max(...p.lines.map((l) => l.y1));
+    p.x0 = Math.min(...p.lines.map((l) => l.x0));
+    p.x1 = Math.max(...p.lines.map((l) => l.x1));
+    // tabular text (aligned columns) renders badly reflowed -> treat as figure
+    let gappy = 0;
+    p.lines.forEach((l) => {
+      for (let i = 1; i < l.words.length; i++) {
+        if (l.words[i].x0 - l.words[i - 1].x1 > cw * 0.055) { gappy++; break; }
+      }
+    });
+    p.tabular = gappy >= 2;
+  });
+  figs = figs.concat(paras.filter((p) => p.tabular)
+    .map((p) => ({ y0: p.y0 - 4, y1: p.y1 + 4, x0: p.x0 - 4, x1: p.x1 + 4 })));
+  mergeFigs();
+  // a text paragraph belongs to a figure when it overlaps it HORIZONTALLY —
+  // inside a bordered table, or a caption above/below the figure. A body
+  // paragraph merely sitting beside a figure stays real text.
+  for (let pass = 0; pass < 2; pass++) {
+    paras.forEach((p) => {
+      if (p.consumed) return;
+      for (const f of figs) {
+        const ovY = Math.min(f.y1, p.y1) - Math.max(f.y0, p.y0);
+        const ovX = Math.min(f.x1, p.x1) - Math.max(f.x0, p.x0);
+        const xFrac = ovX / Math.max(1, p.x1 - p.x0);
+        if ((ovY > (p.y1 - p.y0) * 0.5 && xFrac > 0.3) ||
+            (xFrac > 0.6 && ovY > -60)) {
+          p.consumed = true;
+          f.y0 = Math.min(f.y0, p.y0 - 4); f.y1 = Math.max(f.y1, p.y1 + 4);
+          f.x0 = Math.min(f.x0, p.x0 - 4); f.x1 = Math.max(f.x1, p.x1 + 4);
+          break;
+        }
+      }
+    });
+  }
+
+  // assemble blocks in reading order, assigning word ids for highlighting
+  let wid = 0;
+  const blocks = [];
+  for (const p of paras.filter((p) => !p.consumed && !p.tabular)) {
+    const runs = [];
+    p.lines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
+    if (runs.length) blocks.push({ t: "p", y: p.y0, runs });
+  }
+  for (const f of figs) {
+    const block = {
+      t: "img", y: f.y0,
+      url: await cropBlob(canvas, f.x0 - 2, f.y0 - 2, f.x1 + 2, f.y1 + 2),
+      x0f: Math.max(0, (f.x0 - 2) / cw),
+      wf: Math.min(1, (f.x1 - f.x0 + 4) / cw),
+    };
+    // a right-side figure with body text beside it floats right so the text
+    // wraps around it like the original layout
+    const beside = paras.find((p) => !p.consumed && !p.tabular &&
+      Math.min(f.y1, p.y1) - Math.max(f.y0, p.y0) > (p.y1 - p.y0) * 0.3);
+    if (beside && f.x0 > cw * 0.45) { block.fr = 1; block.y = beside.y0 - 1; }
+    blocks.push(block);
+  }
+  blocks.sort((a, b) => a.y - b.y);
+
+  // choice text runs (only words right of the letter label — this also drops
+  // the radio circle, which some PDFs draw as a symbol-font glyph)
+  const choices = [];
+  for (const pc of pxChoices) {
+    const cws = raw.filter((w) => {
+      const cy = (w.y0 + w.y1) / 2;
+      return cy >= pc.rowTop && cy <= pc.rowBot &&
+             w.x0 >= pc.lx0 - 2 && w.text !== pc.letter + ")";
+    });
+    if (!cws.length) return null;  // image choices etc: fall back whole item
+    const runs = [];
+    clusterTextLines(cws).forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
+    choices.push({ letter: pc.letter, runs });
+  }
+  return { blocks, choices };
 }
 
 /* ---------------- main ------------------------------------------------- */
 
 async function parseExam(qBytes, aBytes, onProgress) {
   const pdfjs = window.pdfjsLib;
-  const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false }).promise;
-  const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false }).promise;
+  const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false, disableFontFace: true }).promise;
+  const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false, disableFontFace: true }).promise;
   const nq = qdoc.numPages, na = adoc.numPages;
 
   /* -- index the answer key (text only, fast) -- */
@@ -266,12 +527,14 @@ async function parseExam(qBytes, aBytes, onProgress) {
     }
 
     const choices = [];
+    const pxChoices = [];
     ordered.forEach(([L, bx], idx) => {
       const [cx, cy, rad] = radioForLetter(img.data, w, h, [bx.x0, bx.y0, bx.x1, bx.y1]);
       const rowTop = bx.y0 - rad * 0.6;
       const rowBot = idx + 1 < ordered.length
         ? ordered[idx + 1][1].y0 - rad * 0.6
         : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0 });
       const rowLeft = cx - rad * 1.6;
       const rowRight = cw * 0.99;
       choices.push({
@@ -300,18 +563,28 @@ async function parseExam(qBytes, aBytes, onProgress) {
     const qStem = stemKey(await getPageText(page));
     const [aPage, letter] = resolveAnswer(pno, qStem);
 
-    // cropped content image -> blob URL
-    const crop = document.createElement("canvas");
-    crop.width = cw; crop.height = ch;
-    crop.getContext("2d").drawImage(canvas, 0, -top);
-    const url = await new Promise((res) =>
-      crop.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
-    qURLs.push(url);
+    // structured real-text content; image mode is the fallback
+    let content = null;
+    try {
+      content = await buildItemContent(rawWords, pxChoices, top, cw, ch,
+                                       canvas, img);
+    } catch (e) { content = null; }
+
+    if (content) {
+      qURLs.push(null);
+    } else {
+      // cropped content image -> blob URL (fallback rendering)
+      const crop = document.createElement("canvas");
+      crop.width = cw; crop.height = ch;
+      crop.getContext("2d").drawImage(canvas, 0, -top);
+      qURLs.push(await new Promise((res) =>
+        crop.toBlob((b) => res(URL.createObjectURL(b)), "image/png")));
+    }
 
     items.push({
       item: pno,
       aspect: Math.round(ch / cw * 1e5) / 1e5,
-      choices, words,
+      choices, words, content,
       correct: letter,
       answer_available: aPage !== null,
       has_answer_image: aPage !== null,

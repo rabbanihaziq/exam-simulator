@@ -12,7 +12,8 @@ const S = {                   // persisted session state
   answers: {},                // item -> letter
   marks: {},                  // item -> true
   struck: {},                 // item -> {letter:true}
-  highlights: {},             // item -> [ [x0,y0,x1,y1], ... ] normalized
+  highlights: {},             // item -> [ [x0,y0,x1,y1], ... ] (image mode)
+  hlw: {},                    // item -> [wordId, ...]        (text mode)
   startedAt: null,
 };
 
@@ -124,6 +125,7 @@ function boot(data) {
   DATA = data;
   LSKEY = "sa_exam_" + DATA.sid;  // isolate saved state per exam file
   loadState();
+  S.hlw = S.hlw || {};            // state saved by older versions lacks this
   $("examTitle").textContent = DATA.title || "Self-Assessment";
   document.title = DATA.title || "Self-Assessment";
   $("brand").textContent = DATA.title || "";
@@ -153,12 +155,108 @@ function showItem(i) {
   $("nextBtn").disabled = cur === DATA.count - 1;
   $("unavail").style.display = it.answer_available ? "none" : "block";
 
-  const img = $("qimg");
-  overlay().innerHTML = "";
-  img.onload = () => layoutItem(it);
-  img.src = DATA.qURLs[cur];
-  if (img.complete && img.naturalWidth) layoutItem(it);
+  if (it.content) {
+    $("stage").style.display = "none";
+    $("qhtml").style.display = "block";
+    renderQuestionHtml(it, $("qhtml"), false);
+    $("content").scrollTop = 0;
+  } else {
+    $("qhtml").style.display = "none";
+    $("stage").style.display = "block";
+    const img = $("qimg");
+    overlay().innerHTML = "";
+    img.onload = () => layoutItem(it);
+    img.src = DATA.qURLs[cur];
+    if (img.complete && img.naturalWidth) layoutItem(it);
+  }
   saveState();
+}
+
+/* ------------------------------------------------------------------ */
+/* real-text question rendering                                        */
+/* ------------------------------------------------------------------ */
+function renderRuns(runs, hlSet) {
+  return runs.map((r) => {
+    let t = escHtml(r.text);
+    if (r.sup) t = `<sup>${t}</sup>`;
+    else if (r.sub) t = `<sub>${t}</sub>`;
+    const cls = ["w"];
+    if (r.i) cls.push("i");
+    if (r.b) cls.push("b");
+    if (hlSet.has(r.wid)) cls.push("hlw");
+    return `<span class="${cls.join(" ")}" data-wi="${r.wid}">${t} </span>`;
+  }).join("");
+}
+
+function renderQuestionHtml(it, container, review) {
+  const hlSet = new Set(S.hlw[it.item] || []);
+  const your = S.answers[it.item];
+  let html = "";
+  it.content.blocks.forEach((b) => {
+    if (b.t === "p") {
+      html += `<p class="qpara">${renderRuns(b.runs, hlSet)}</p>`;
+    } else if (b.fr) {
+      html += `<img class="qfig fr" src="${b.url}" ` +
+        `style="width:${(b.wf * 100).toFixed(2)}%">`;
+    } else {
+      html += `<img class="qfig" src="${b.url}" ` +
+        `style="width:${(b.wf * 100).toFixed(2)}%;margin-left:${(b.x0f * 100).toFixed(2)}%">`;
+    }
+  });
+  html += `<div class="copts">` + it.content.choices.map((c) => {
+    const cls = ["copt"];
+    if (your === c.letter) cls.push("sel");
+    if (S.struck[it.item] && S.struck[it.item][c.letter]) cls.push("struck");
+    if (review) {
+      if (c.letter === it.correct) cls.push("correct");
+      if (your === c.letter && c.letter !== it.correct) cls.push("wrongpick");
+    }
+    return `<div class="${cls.join(" ")}" data-letter="${c.letter}">` +
+      (review ? `<span class="cmark"></span>` : "") +
+      `<span class="cradio"><span class="cdot"></span></span>` +
+      `<span class="clab">${c.letter})</span>` +
+      `<span class="ctext">${renderRuns(c.runs, hlSet)}</span></div>`;
+  }).join("") + `</div>`;
+  container.innerHTML = html;
+  container.classList.toggle("hl-mode", hlOn && !review);
+  if (review) {
+    container.querySelectorAll(".copt.correct .cmark").forEach((m) =>
+      m.appendChild(markSvg("good", 20)));
+    container.querySelectorAll(".copt.wrongpick .cmark").forEach((m) =>
+      m.appendChild(markSvg("bad", 20)));
+  }
+}
+
+function applyHlwClasses(container, it) {
+  const set = new Set(S.hlw[it.item] || []);
+  container.querySelectorAll("span.w").forEach((s) =>
+    s.classList.toggle("hlw", set.has(+s.dataset.wi)));
+}
+
+function commitHtmlHighlight(sel, container, it) {
+  const spans = container.querySelectorAll("span.w");
+  const picked = [];
+  spans.forEach((s) => { if (sel.containsNode(s, true)) picked.push(+s.dataset.wi); });
+  if (!picked.length) return false;
+  const set = new Set(S.hlw[it.item] || []);
+  picked.forEach((i) => set.add(i));
+  S.hlw[it.item] = [...set].sort((a, b) => a - b);
+  sel.removeAllRanges();
+  saveState();
+  applyHlwClasses(container, it);
+  return true;
+}
+
+function removeHlRun(it, wi, container) {
+  const set = new Set(S.hlw[it.item] || []);
+  if (!set.has(wi)) return;
+  let a = wi, b = wi;
+  while (set.has(a - 1)) a--;
+  while (set.has(b + 1)) b++;
+  for (let i = a; i <= b; i++) set.delete(i);
+  S.hlw[it.item] = [...set].sort((x, y) => x - y);
+  saveState();
+  applyHlwClasses(container, it);
 }
 
 function layoutItem(it) {
@@ -295,8 +393,10 @@ function drawHighlights(it) {
 function selectChoice(letter) {
   const it = item(cur);
   S.answers[it.item] = letter;
-  overlay().querySelectorAll(".choice").forEach((el) =>
-    el.classList.toggle("sel", el.dataset.letter === letter));
+  const sel = it.content
+    ? document.querySelectorAll("#qhtml .copt")
+    : overlay().querySelectorAll(".choice");
+  sel.forEach((el) => el.classList.toggle("sel", el.dataset.letter === letter));
   saveState();
 }
 function toggleStrike(letter) {
@@ -304,8 +404,9 @@ function toggleStrike(letter) {
   S.struck[it.item] = S.struck[it.item] || {};
   if (S.struck[it.item][letter]) delete S.struck[it.item][letter];
   else S.struck[it.item][letter] = true;
-  const el = [...overlay().querySelectorAll(".choice")]
-    .find((e) => e.dataset.letter === letter);
+  const root = it.content ? document.querySelectorAll("#qhtml .copt")
+                          : overlay().querySelectorAll(".choice");
+  const el = [...root].find((e) => e.dataset.letter === letter);
   if (el) el.classList.toggle("struck", !!S.struck[it.item][letter]);
   saveState();
 }
@@ -345,7 +446,24 @@ function onStageMove(e) {
   if (tl) tl.style.cursor = L ? "pointer" : "";
 }
 
+let hlSuppress = false;  // a selection-drag's trailing click must not answer
+
+function onWindowUp() {
+  // text-mode items: native selection -> word highlights
+  if (reviewing || !DATA) return false;
+  const it = item(cur);
+  if (!it.content) return false;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && hlOn &&
+      commitHtmlHighlight(sel, $("qhtml"), it)) {
+    hlSuppress = true;
+    setTimeout(() => { hlSuppress = false; }, 0);
+  }
+  return true;
+}
+
 function onStageUp(e) {
+  if (onWindowUp()) return;
   if (!downPos) return;
   const d = downPos; downPos = null;
   if (reviewing) return;
@@ -398,8 +516,10 @@ function removeHighlight(idx) {
 function clearHighlights() {
   const it = item(cur);
   S.highlights[it.item] = [];
+  S.hlw[it.item] = [];
   saveState();
-  drawHighlights(it);
+  if (it.content) applyHlwClasses($("qhtml"), it);
+  else drawHighlights(it);
 }
 
 /* ------------------------------------------------------------------ */
@@ -441,6 +561,7 @@ function wireChrome() {
     $("hlLabel").textContent = hlOn ? "Highlight: on" : "Highlight: off";
     const tl = overlay().querySelector(".textlayer");
     if (tl) tl.classList.toggle("hl-mode", hlOn);
+    $("qhtml").classList.toggle("hl-mode", hlOn);
   };
   $("hlBtn").style.background = "#ffffff33";
   $("hlLabel").textContent = "Highlight: on";
@@ -479,6 +600,22 @@ function wireChrome() {
     if (L) { e.preventDefault(); toggleStrike(L); }
   });
 
+  // real-text question interactions
+  const qh = $("qhtml");
+  qh.addEventListener("click", (e) => {
+    if (reviewing) return;
+    const w = e.target.closest && e.target.closest("span.w.hlw");
+    if (w) { removeHlRun(item(cur), +w.dataset.wi, qh); return; }
+    if (hlSuppress) return;
+    const opt = e.target.closest && e.target.closest(".copt");
+    if (opt) selectChoice(opt.dataset.letter);
+  });
+  qh.addEventListener("contextmenu", (e) => {
+    if (reviewing) return;
+    const opt = e.target.closest && e.target.closest(".copt");
+    if (opt) { e.preventDefault(); toggleStrike(opt.dataset.letter); }
+  });
+
   // modal close handlers
   document.querySelectorAll(".modal-back").forEach((m) => {
     m.addEventListener("click", (e) => {
@@ -508,11 +645,12 @@ function wireChrome() {
     }
   });
 
-  // keep overlays aligned on resize
+  // keep image-mode overlays aligned on resize (text mode reflows itself)
   let rt = null;
   window.addEventListener("resize", () => {
     clearTimeout(rt);
     rt = setTimeout(() => {
+      if (item(cur).content) return;
       if (reviewing) layoutReview(item(cur));
       else layoutItem(item(cur));
     }, 120);
@@ -692,6 +830,7 @@ async function showReview(i) {
     strip.innerHTML = `<b>Item ${it.item}</b> <span class="pill">Your answer: ${your || "—"}</span>` +
       `<span class="pill">Not in answer key</span>`;
     rstage.style.display = "none";
+    $("rhtml").style.display = "none";
     na.style.display = "block";
     na.innerHTML = `The answer-key PDF did not include item ${it.item}, so it can't be shown here ` +
       `and wasn't counted in your score.`;
@@ -708,11 +847,18 @@ async function showReview(i) {
 
   // the question as YOU left it: your pick, strikes, highlights — plus
   // right/wrong markers
-  rstage.style.display = "block";
-  const rimg = $("rimg");
-  rimg.onload = () => layoutReview(it);
-  rimg.src = DATA.qURLs[cur];
-  if (rimg.complete && rimg.naturalWidth) layoutReview(it);
+  if (it.content) {
+    rstage.style.display = "none";
+    $("rhtml").style.display = "block";
+    renderQuestionHtml(it, $("rhtml"), true);
+  } else {
+    $("rhtml").style.display = "none";
+    rstage.style.display = "block";
+    const rimg = $("rimg");
+    rimg.onload = () => layoutReview(it);
+    rimg.src = DATA.qURLs[cur];
+    if (rimg.complete && rimg.naturalWidth) layoutReview(it);
+  }
   $("reviewwrap").scrollTop = 0;
 
   // explanation as clean text; fall back to the answer-page image

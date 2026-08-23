@@ -445,8 +445,8 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
 
 async function parseExam(qBytes, aBytes, onProgress) {
   const pdfjs = window.pdfjsLib;
-  const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false }).promise;
-  const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false }).promise;
+  const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false, disableFontFace: true }).promise;
+  const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false, disableFontFace: true }).promise;
   const nq = qdoc.numPages, na = adoc.numPages;
 
   /* -- index the answer key (text only, fast) -- */
