@@ -153,6 +153,23 @@ async function getPageText(page) {
   return (await getPageLines(page)).map((l) => l.text).join("\n");
 }
 
+/* Render with a stall watchdog: PDF.js renders of these very large pages
+   occasionally never resolve (lost worker message); cancelling and retrying
+   reliably unsticks them. */
+async function renderPage(page, viewport, ctx) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const task = page.render({ canvasContext: ctx, viewport });
+    const result = await Promise.race([
+      task.promise.then(() => "ok").catch(() => "cancelled"),
+      new Promise((res) => setTimeout(() => res("timeout"), 7000)),
+    ]);
+    if (result === "ok") return;
+    try { task.cancel(); } catch (e) {}
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error("page render stalled");
+}
+
 /* Extract positioned words from a page, in canvas pixel coords, with font
    style flags (italic/bold) resolved from the page's loaded fonts. Must be
    called after the page has been rendered so commonObjs is populated. */
@@ -493,7 +510,7 @@ async function parseExam(qBytes, aBytes, onProgress) {
     const canvas = document.createElement("canvas");
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    await renderPage(page, viewport, ctx);
     const img = ctx.getImageData(0, 0, w, h);
 
     const [top, bottom] = contentBand(img.data, w, h);
@@ -604,7 +621,7 @@ async function parseExam(qBytes, aBytes, onProgress) {
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(viewport.width);
     canvas.height = Math.round(viewport.height);
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    await renderPage(page, viewport, canvas.getContext("2d"));
     const url = await new Promise((res) =>
       canvas.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
     aCache.set(it.a_page, url);
