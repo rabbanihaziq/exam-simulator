@@ -1,0 +1,50 @@
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "Exam Simulator" --add-data "app/templates;templates" --add-data "app/static;static" --paths app app/app.py
+
+      - name: Package
+        shell: bash
+        run: |
+          cp windows-readme.txt "dist/Read Me First.txt"
+          cd dist && 7z a "../ExamSimulator-Windows.zip" .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExamSimulator-Windows
+          path: dist/
+
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "ExamSimulator-Windows.zip" \
+            --title "Exam Simulator — latest build" \
+            --notes "Windows app, automatically built from the newest code. Download the zip, unzip, read 'Read Me First.txt'."

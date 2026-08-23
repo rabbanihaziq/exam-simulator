@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-Assessment</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='exam.css') }}">
+</head>
+<body>
+<div id="app">
+  <div id="topred"></div>
+
+  <!-- exam top bar -->
+  <div id="topbar">
+    <div class="seg left">
+      <div class="itemno">Exam Section: Item <span id="curno">1</span> of <span id="total">50</span></div>
+      <label class="mark" id="markLbl"><input type="checkbox" id="markChk"> Mark</label>
+    </div>
+    <div class="seg mid">
+      <div class="title2" id="examTitle">Self-Assessment</div>
+    </div>
+    <div class="seg right">
+      <div class="tlabel">Time Remaining</div>
+      <div class="timer" id="timer">--:--</div>
+    </div>
+  </div>
+
+  <!-- review bar (hidden until submit) -->
+  <div id="reviewbar" style="display:none">
+    <div><span class="score" id="scoreBig">0%</span></div>
+    <div class="sub" id="scoreSub"></div>
+    <div class="spacer" style="flex:1"></div>
+    <button class="btn ghost" id="exitReview">Back to exam</button>
+    <button class="btn primary" id="newExam">New exam</button>
+  </div>
+
+  <!-- exam content -->
+  <div id="content">
+    <div id="unavail">⚠︎ The answer key did not include this item — it won't be scored.</div>
+    <div id="stage">
+      <img id="qimg" alt="question">
+      <div id="overlay"></div>
+    </div>
+  </div>
+
+  <!-- review content -->
+  <div id="reviewwrap" style="display:none">
+    <div class="resultstrip" id="resultstrip"></div>
+    <img id="reviewimg" alt="answer">
+    <div class="na-note" id="naNote" style="display:none"></div>
+  </div>
+
+  <!-- bottom bar -->
+  <div id="footbar">
+    <button class="fbtn" id="prevBtn"><span class="ic">◀</span>Previous</button>
+    <button class="fbtn" id="nextBtn"><span class="ic">▶</span>Next</button>
+    <button class="fbtn" id="hlBtn"><span class="ic">🖊</span><span id="hlLabel">Highlight</span></button>
+    <button class="fbtn" id="clearHlBtn"><span class="ic">⌫</span>Clear</button>
+    <div class="spacer"></div>
+    <div class="fbrand" id="brand"></div>
+    <div class="spacer"></div>
+    <button class="fbtn" id="labBtn"><span class="ic">🧪</span>Lab Values</button>
+    <button class="fbtn" id="calcBtn"><span class="ic">🧮</span>Calculator</button>
+    <button class="fbtn nav" id="navBtn"><span class="ic">▦</span>Navigator</button>
+    <button class="fbtn end" id="endBtn"><span class="ic">■</span>End Block</button>
+  </div>
+</div>
+
+<!-- Lab Values modal -->
+<div class="modal-back" id="labModal">
+  <div class="modal">
+    <div class="mhead">
+      <span>Laboratory Reference Values</span>
+      <label class="si-toggle"><input type="checkbox" id="siToggle"> Show SI units</label>
+      <span class="x" data-close>×</span>
+    </div>
+    <div class="labtabs" id="labTabs"></div>
+    <div class="labsearch"><input type="text" id="labSearch" placeholder="Search a test (e.g. sodium, TSH, hematocrit)…"></div>
+    <div class="mbody" id="labBody" style="width:820px;max-width:90vw;height:60vh"></div>
+  </div>
+</div>
+
+<!-- Calculator modal -->
+<div class="modal-back" id="calcModal">
+  <div class="modal">
+    <div class="mhead"><span>Calculator</span><span class="x" data-close>×</span></div>
+    <div class="mbody">
+      <div class="calc-disp" id="calcDisp">0</div>
+      <div class="calc-grid" id="calcGrid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Navigator modal -->
+<div class="modal-back" id="navModal">
+  <div class="modal">
+    <div class="mhead"><span>Item Navigator</span><span class="x" data-close>×</span></div>
+    <div class="mbody">
+      <div class="navgrid" id="navGrid"></div>
+      <div class="navlegend">
+        <span><i class="sw" style="background:#dcecff"></i> Answered</span>
+        <span><i class="sw" style="background:#fff;border-color:#cdd7e2"></i> Unanswered</span>
+        <span><i class="sw" style="background:#fff;position:relative">
+          <i style="position:absolute;top:0;right:0;border-top:8px solid #e6b800;border-left:8px solid transparent"></i></i> Marked</span>
+        <span><i class="sw" style="background:#f4f4f4"></i> No answer key</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm end modal -->
+<div class="modal-back" id="endModal">
+  <div class="modal">
+    <div class="mhead"><span>End Block</span><span class="x" data-close>×</span></div>
+    <div class="confirm-text" id="endText"></div>
+    <div class="mfoot">
+      <button class="btn ghost" data-close>Keep working</button>
+      <button class="btn danger" id="confirmEnd">End &amp; score</button>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='labvalues.js') }}"></script>
+<script src="{{ url_for('static', filename='exam.js') }}"></script>
+</body>
+</html>

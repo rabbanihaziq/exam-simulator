@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-Assessment Exam Simulator</title>
+<style>
+  :root { --navy:#1b3a67; --navy2:#24507f; --red:#8b0000; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+         background:#eef1f5; color:#1c2733; }
+  .topbar { background:var(--navy); color:#fff; height:6px; }
+  .wrap { max-width:720px; margin:6vh auto; padding:0 20px; }
+  .card { background:#fff; border-radius:12px; box-shadow:0 6px 30px rgba(20,40,70,.12);
+          padding:34px 38px; }
+  h1 { margin:0 0 4px; font-size:26px; color:var(--navy); letter-spacing:.2px; }
+  .sub { color:#5a6b7d; margin:0 0 26px; font-size:15px; }
+  label.f { display:block; font-weight:600; margin:18px 0 7px; font-size:14px; }
+  .hint { font-weight:400; color:#7a8794; font-size:12.5px; }
+  .drop { border:2px dashed #b8c4d2; border-radius:9px; padding:16px; background:#f7f9fc;
+          display:flex; align-items:center; gap:12px; transition:.15s; cursor:pointer; }
+  .drop:hover { border-color:var(--navy2); background:#eef4fb; }
+  .drop.filled { border-color:#2e7d32; background:#eefaf0; }
+  .drop input { display:none; }
+  .drop .ic { font-size:26px; }
+  .drop .txt { font-size:14px; color:#42566a; }
+  .drop .txt b { color:#1c2733; }
+  .row { display:flex; gap:22px; align-items:flex-end; margin-top:22px; flex-wrap:wrap; }
+  .minutes { width:130px; }
+  .minutes input { width:100%; padding:9px 11px; border:1px solid #c3cedb; border-radius:7px;
+                   font-size:15px; }
+  button.start { margin-top:28px; width:100%; background:var(--navy); color:#fff; border:none;
+          padding:14px; font-size:16px; font-weight:600; border-radius:8px; cursor:pointer;
+          letter-spacing:.3px; }
+  button.start:hover { background:#16305a; }
+  button.start:disabled { background:#9aa8b8; cursor:not-allowed; }
+  .err { background:#fdecec; color:#8b0000; border:1px solid #f3c4c4; padding:11px 14px;
+         border-radius:8px; font-size:14px; margin-bottom:18px; }
+  .foot { color:#8593a2; font-size:12px; margin-top:22px; line-height:1.6; }
+  .foot b { color:#5a6b7d; }
+</style>
+</head>
+<body>
+<div class="topbar"></div>
+<div class="wrap">
+  <div class="card">
+    <h1>Self-Assessment Exam Simulator</h1>
+    <p class="sub">Load a questions PDF and its answer-key PDF to start a timed, exam-style session.</p>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <form method="post" action="/start" enctype="multipart/form-data" id="form">
+      <label class="f">Questions PDF <span class="hint">— the unlabeled exam you take blind</span></label>
+      <label class="drop" id="drop-q">
+        <span class="ic">📄</span>
+        <span class="txt" id="txt-q"><b>Click to choose</b> or drop the questions PDF here</span>
+        <input type="file" name="questions" accept="application/pdf" required>
+      </label>
+
+      <label class="f">Answer-key PDF <span class="hint">— the version with correct answers &amp; explanations</span></label>
+      <label class="drop" id="drop-a">
+        <span class="ic">🔑</span>
+        <span class="txt" id="txt-a"><b>Click to choose</b> or drop the answer-key PDF here</span>
+        <input type="file" name="answers" accept="application/pdf" required>
+      </label>
+
+      <div class="row">
+        <div class="minutes">
+          <label class="f" style="margin-top:0">Time limit (min)</label>
+          <input type="number" name="minutes" value="60" min="0" max="600">
+        </div>
+        <div class="hint" style="flex:1;padding-bottom:10px">
+          Set to <b>0</b> for an untimed session. The timer counts down and turns red near the end,
+          but never forces a submit.
+        </div>
+      </div>
+
+      <button class="start" id="go" type="submit">Start exam</button>
+    </form>
+    <div class="foot">
+      Everything runs locally on your machine — the PDFs are parsed here and never uploaded anywhere.
+      In the exam you can <b>drag to highlight</b> text, open <b>Lab Values</b> and the <b>Calculator</b>,
+      mark items for review, and jump around with the navigator.
+    </div>
+  </div>
+</div>
+<script>
+  function wire(id, txtId){
+    const drop=document.getElementById(id), input=drop.querySelector('input'),
+          txt=document.getElementById(txtId);
+    input.addEventListener('change',()=>{ if(input.files[0]){
+      txt.innerHTML='<b>'+input.files[0].name+'</b>'; drop.classList.add('filled'); }});
+    ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();
+      drop.style.borderColor='#24507f';}));
+    ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();
+      drop.style.borderColor='';}));
+    drop.addEventListener('drop',ev=>{ if(ev.dataTransfer.files[0]){
+      input.files=ev.dataTransfer.files;
+      input.dispatchEvent(new Event('change')); }});
+  }
+  wire('drop-q','txt-q'); wire('drop-a','txt-a');
+  document.getElementById('form').addEventListener('submit',()=>{
+    const b=document.getElementById('go'); b.disabled=true; b.textContent='Loading & parsing PDFs…';
+  });
+</script>
+</body>
+</html>
