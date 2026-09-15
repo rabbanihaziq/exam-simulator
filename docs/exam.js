@@ -572,6 +572,7 @@ function wireChrome() {
   $("endBtn").onclick = () => { buildEndText(); openModal("endModal"); };
   $("confirmEnd").onclick = () => { closeModal(); submitExam(); };
   $("exitReview").onclick = () => exitReview();
+  wireExport();
   $("newExam").onclick = () => { location.reload(); };
   $("origBtn").onclick = async () => {
     const img = $("reviewimg");
@@ -970,6 +971,126 @@ function exitReview() {
   $("endBtn").style.display = "";
   startTimer();
   showItem(cur);
+}
+
+/* ------------------------------------------------------------------ */
+/* export results (your answers vs the key) as Markdown / JSON         */
+/* ------------------------------------------------------------------ */
+function runsText(runs) {
+  return (runs || []).map((r) => r.text).join(" ").replace(/\s+/g, " ").trim();
+}
+function itemResult(it) {
+  const your = S.answers[it.item];
+  if (!it.answer_available) return "no_key";
+  if (!your) return "skipped";
+  return your === it.correct ? "correct" : "incorrect";
+}
+async function buildExport(includeExpl, onProgress) {
+  const sc = DATA._score || { correct: 0, scored: 0, pct: 0 };
+  const items = [];
+  for (let i = 0; i < DATA.items.length; i++) {
+    const it = DATA.items[i];
+    const rec = {
+      item: it.item,
+      your: S.answers[it.item] || null,
+      correct: it.answer_available ? it.correct : null,
+      result: itemResult(it),
+      marked: !!S.marks[it.item],
+      struck: Object.keys(S.struck[it.item] || {}).sort(),
+    };
+    if (it.content) {
+      rec.stem = it.content.blocks.filter((b) => b.t === "p").map((b) => runsText(b.runs)).join("\n");
+      rec.choices = it.content.choices.map((c) => ({ letter: c.letter, text: runsText(c.runs) }));
+    }
+    if (includeExpl && it.answer_available && DATA.answerInfo) {
+      if (onProgress) onProgress(`Reading answer-key page for item ${it.item}… (${i + 1}/${DATA.items.length})`);
+      try {
+        const info = await DATA.answerInfo(i);
+        if (info && info.paragraphs) rec.explanation = info.paragraphs;
+      } catch (e) {}
+    }
+    items.push(rec);
+  }
+  const counts = { correct: 0, incorrect: 0, skipped: 0, no_key: 0 };
+  items.forEach((r) => counts[r.result]++);
+  const json = {
+    title: DATA.title || "Self-Assessment",
+    sid: DATA.sid || null,
+    exported_at: new Date().toISOString(),
+    started_at: S.startedAt ? new Date(S.startedAt).toISOString() : null,
+    score: { correct: sc.correct, scored: sc.scored, pct: sc.pct },
+    counts, items,
+  };
+
+  const mark = { correct: "✓ Correct", incorrect: "✗ Incorrect", skipped: "○ Skipped", no_key: "– Not in key" };
+  const md = [];
+  md.push(`# ${json.title} — results`);
+  md.push(`Exported ${json.exported_at.slice(0, 10)}. Score **${sc.correct}/${sc.scored} (${sc.pct}%)** — ` +
+    `${counts.incorrect} incorrect, ${counts.skipped} skipped, ${counts.no_key} not in key.`);
+  const missed = items.filter((r) => r.result === "incorrect" || r.result === "skipped").map((r) => r.item);
+  const marked = items.filter((r) => r.marked).map((r) => r.item);
+  md.push(`Missed: ${missed.length ? missed.join(", ") : "none"}. Marked: ${marked.length ? marked.join(", ") : "none"}.`);
+  md.push("");
+  md.push("| Item | Yours | Key | Result | Marked |");
+  md.push("|---|---|---|---|---|");
+  items.forEach((r) => md.push(`| ${r.item} | ${r.your || "—"} | ${r.correct || "—"} | ${mark[r.result]} | ${r.marked ? "yes" : ""} |`));
+  const hasDetail = items.some((r) => r.stem || r.explanation);
+  if (hasDetail) {
+    md.push("");
+    md.push("## Items");
+    items.forEach((r) => {
+      md.push("");
+      md.push(`### Item ${r.item} — ${mark[r.result]} (yours ${r.your || "—"}, key ${r.correct || "—"})` +
+        (r.marked ? " · marked" : ""));
+      if (r.stem) md.push(r.stem);
+      if (r.choices) r.choices.forEach((c) => md.push(`- ${c.letter}. ${c.text}`));
+      if (r.explanation) { md.push(""); md.push("**Answer key:** " + r.explanation.join("\n\n")); }
+    });
+  }
+  return { json, md: md.join("\n") + "\n" };
+}
+function downloadText(name, text, mime) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: mime }));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function exportBaseName() {
+  return (DATA.title || "self-assessment").replace(/[^\w\-]+/g, "_").replace(/^_+|_+$/g, "") +
+    "_results_" + new Date().toISOString().slice(0, 10);
+}
+let EXPORT = null;
+async function refreshExport() {
+  const inc = $("exportExpl").checked;
+  const box = $("exportText");
+  $("exportCopy").disabled = $("exportMd").disabled = $("exportJson").disabled = true;
+  box.value = "Building export…";
+  $("exportStatus").textContent = "";
+  EXPORT = await buildExport(inc, (m) => { $("exportStatus").textContent = m; });
+  $("exportStatus").textContent = "";
+  box.value = EXPORT.md;
+  $("exportCopy").disabled = $("exportMd").disabled = $("exportJson").disabled = false;
+}
+function wireExport() {
+  if (!$("exportBtn")) return;
+  $("exportBtn").onclick = () => { openModal("exportModal"); refreshExport(); };
+  $("exportExpl").onchange = refreshExport;
+  $("exportCopy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText($("exportText").value);
+      $("exportCopy").textContent = "Copied ✓";
+    } catch (e) {
+      $("exportText").select();
+      document.execCommand("copy");
+      $("exportCopy").textContent = "Copied ✓";
+    }
+    setTimeout(() => { $("exportCopy").textContent = "Copy"; }, 1500);
+  };
+  $("exportMd").onclick = () => EXPORT && downloadText(exportBaseName() + ".md", EXPORT.md, "text/markdown");
+  $("exportJson").onclick = () => EXPORT &&
+    downloadText(exportBaseName() + ".json", JSON.stringify(EXPORT.json, null, 2), "application/json");
 }
 
 /* ------------------------------------------------------------------ */

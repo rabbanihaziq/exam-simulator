@@ -33,6 +33,12 @@ with a modern browser (Chrome recommended).
   *Your answer vs Correct* banner and a **% correct**.
 - Progress is saved in the browser per exam file, so a refresh — or coming
   back later and re-selecting the same PDF — resumes where you left off.
+- **Export results** — after scoring, the review bar has an **Export results**
+  button: a Markdown table of every item (your answer, the key, right/wrong/
+  skipped, marked) plus each question's text and choices, and optionally the
+  answer-key explanation for every item. **Copy** it straight into an AI chat
+  ("here are my misses, find the pattern"), or download it as `.md` / `.json`.
+  Nothing leaves your browser until you paste or download.
 
 ## Notes
 

@@ -119,6 +119,7 @@
     <div><span class="score" id="scoreBig">0%</span></div>
     <div class="sub" id="scoreSub"></div>
     <div class="spacer" style="flex:1"></div>
+    <button class="btn ghost" id="exportBtn">Export results</button>
     <button class="btn ghost" id="exitReview">Back to exam</button>
     <button class="btn primary" id="newExam">New exam</button>
   </div>
@@ -200,6 +201,26 @@
           <i style="position:absolute;top:0;right:0;border-top:8px solid #e6b800;border-left:8px solid transparent"></i></i> Marked</span>
         <span><i class="sw" style="background:#f4f4f4"></i> No answer key</span>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Export results modal -->
+<div class="modal-back" id="exportModal">
+  <div class="modal">
+    <div class="mhead"><span>Export results</span><span class="x" data-close>×</span></div>
+    <div class="mbody export-body">
+      <p class="export-note">Your answers vs the answer key, with each question's text and (optionally) the answer-key explanation. Paste the text into an AI chat to analyze your
+        misses, or download it. Nothing leaves your browser until you do.</p>
+      <label class="export-opt"><input type="checkbox" id="exportExpl"> Include answer-key explanations (reads every key page — takes a minute)</label>
+      <div class="export-status" id="exportStatus"></div>
+      <textarea id="exportText" readonly spellcheck="false"></textarea>
+    </div>
+    <div class="mfoot">
+      <button class="btn ghost" data-close>Close</button>
+      <button class="btn ghost" id="exportJson">Download .json</button>
+      <button class="btn ghost" id="exportMd">Download .md</button>
+      <button class="btn primary" id="exportCopy">Copy</button>
     </div>
   </div>
 </div>
