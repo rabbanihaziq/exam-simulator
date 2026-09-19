@@ -305,6 +305,44 @@ function inkFigures(imgData, top, stemBot, textRects) {
   return bands.filter((b) => b.y1 - b.y0 >= 10 && b.x1 - b.x0 >= 10);
 }
 
+/* Let a figure run past the first answer choice.
+
+   inkFigures only scans the stem band, because below it the answer choices'
+   radio circles and text are ink too. But some items are laid out in two
+   columns, with the exhibit in a column beside the stem that continues well
+   past choice A — scanning only the stem band slices such an image in half.
+   A figure whose column is clear of the choice text can safely be followed
+   down to the bottom of the content. */
+function extendFiguresBelow(imgData, figs, stemBot, contentBot, textRects, pxChoices) {
+  const data = imgData.data, W = imgData.width;
+  // Only the radio circles are ink the text mask can't hide, and they sit just
+  // left of the choice letters, so a figure starting right of the letters can
+  // be followed down safely. Choice text itself is masked, and a figure column
+  // that does overlap it simply finds no ink and stops.
+  const lettersEnd = pxChoices.reduce((m, c) => Math.max(m, c.lx1), 0);
+  for (const f of figs) {
+    if (f.x0 < lettersEnd + 8) continue;   // shares the column with the choices
+    let lastInk = f.y1, gap = 0;
+    for (let y = Math.ceil(stemBot); y < Math.floor(contentBot); y += 2) {
+      const iv = [];
+      for (const r of textRects) if (y >= r[1] && y <= r[3]) iv.push([r[0], r[2]]);
+      iv.sort((a, b) => a[0] - b[0]);
+      let cnt = 0, k = 0;
+      const from = Math.max(0, Math.floor(f.x0)), to = Math.min(W, Math.ceil(f.x1));
+      for (let x = from; x < to; x += 2) {
+        while (k < iv.length && x > iv[k][1]) k++;
+        if (k < iv.length && x >= iv[k][0]) continue;
+        const idx = (y * W + x) * 4;
+        const d = Math.max(255 - data[idx], 255 - data[idx + 1], 255 - data[idx + 2]);
+        if (d > 40) cnt++;
+      }
+      if (cnt >= 3) { lastInk = y; gap = 0; }
+      else if (y > f.y1) { gap += 2; if (gap > 24) break; }
+    }
+    f.y1 = Math.max(f.y1, lastInk);
+  }
+}
+
 function cropBlob(canvas, x0, y0, x1, y1) {
   const c = document.createElement("canvas");
   c.width = Math.max(1, Math.round(x1 - x0));
@@ -357,7 +395,6 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     }
   }
   mergeFigs();
-
   // words that live inside/near a figure region are part of it (chart titles,
   // axis labels, values inside a diagram) — absorb them so side-by-side
   // column layouts don't corrupt the body-text lines
@@ -427,6 +464,12 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     });
   }
 
+  // Last, once every figure's extent is settled: follow a figure that sits in
+  // its own column down past the answer choices. Done here so a taller figure
+  // can't feed back into the merging and paragraph-absorbing above, where it
+  // could chain across the page and swallow the stem.
+  extendFiguresBelow(imgData, figs, stemBot, top + ch, textRects, pxChoices);
+
   // assemble blocks in reading order, assigning word ids for highlighting
   let wid = 0;
   const blocks = [];
@@ -467,8 +510,15 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     // the last choice runs to the end of the content, never into the footer bar
     const next = pxChoices[ci + 1];
     const to = next ? next.base - next.tol : top + ch;
-    const cws = raw.filter((w) => w.base >= from && w.base < to &&
-                                  w.x0 >= pc.lx0 - 2 && w.text !== pc.letter + ")");
+    const cws = raw.filter((w) => {
+      if (!(w.base >= from && w.base < to)) return false;
+      if (w.x0 < pc.lx0 - 2 || w.text === pc.letter + ")") return false;
+      // a label OCR'd inside the exhibit (an "R" orientation marker on an
+      // x-ray) can share a choice's baseline; it belongs to the figure
+      const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
+      return !figs.some((f) => cx > f.x0 - 4 && cx < f.x1 + 4 &&
+                               cy > f.y0 - 4 && cy < f.y1 + 4);
+    });
     if (!cws.length) return null;  // image choices etc: fall back whole item
     const runs = [];
     clusterTextLines(cws).forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
@@ -820,8 +870,8 @@ async function parseExam(qBytes, aBytes, onProgress) {
       const rowBot = idx + 1 < ordered.length
         ? ordered[idx + 1][1].y0 - rad * 0.6
         : bx.y1 + (bx.y1 - bx.y0) * 1.4;
-      pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0, base: bx.base,
-                       tol: (bx.y1 - bx.y0) * 0.4 });
+      pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0, lx1: bx.x1,
+                       base: bx.base, tol: (bx.y1 - bx.y0) * 0.4 });
       const rowLeft = cx - rad * 1.6;
       const rowRight = cw * 0.99;
       choices.push({
