@@ -121,7 +121,7 @@ def img_q(item: int):
         abort(404)
     if item < 1 or item > len(parser.items):
         abort(404)
-    png = parser.question_png(parser.items[item - 1].q_page)
+    png = parser.question_png(item - 1)
     return send_file(io.BytesIO(png), mimetype="image/png",
                      max_age=3600)
 
@@ -136,7 +136,7 @@ def img_a(item: int):
     it = parser.items[item - 1]
     if it.a_page is None:
         abort(404)
-    png = parser.answer_png(it.a_page)
+    png = parser.answer_png(item - 1)
     return send_file(io.BytesIO(png), mimetype="image/png", max_age=3600)
 
 
