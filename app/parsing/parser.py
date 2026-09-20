@@ -56,7 +56,7 @@ def _stem_key(text: str) -> str:
     # Drop everything up to and including the leading "N." item number.
     t = _ITEM_MARK.sub(" ", text, count=1)
     # Stop at the first answer choice or the answer-key marker.
-    t = re.split(r"\n\s*[A-J]\)|Correct\s*Answer", t)[0]
+    t = re.split(r"\n\s*[A-Z]\)|Correct\s*Answer", t)[0]
     return _norm(t)[:350]
 
 
@@ -119,7 +119,7 @@ def _similarity(a: str, b: str) -> float:
 
 
 def _correct_letter(text: str) -> str | None:
-    m = re.search(r"Correct\s*Answer:\s*([A-J])", text)
+    m = re.search(r"Correct\s*Answer:\s*([A-Z])", text)
     return m.group(1) if m else None
 
 
@@ -163,6 +163,30 @@ def _png_bytes(arr: np.ndarray) -> bytes:
     arr = np.ascontiguousarray(arr)
     pix = fitz.Pixmap(fitz.csRGB, arr.shape[1], arr.shape[0], arr.tobytes(), False)
     return pix.tobytes("png")
+
+
+def _choice_columns(ordered, cw: float) -> list[list[int]]:
+    """Group the choice labels into columns, left to right.
+
+    Answer choices are not always one column: a ten-choice item prints A to E
+    down the left half and F to J down the right, a seventeen-choice one runs
+    A to I left and J to Q right.  Jitter within one column is a few pixels
+    (the labels are right-aligned, so "I)" starts further right than "M)"),
+    while the step to the next column is most of the page.  Members come back
+    in reading order down their own column.
+    """
+    thr = max(cw * 0.08, 40)
+    cols: list[list[int]] = []
+    last_x = None
+    for i in sorted(range(len(ordered)), key=lambda i: ordered[i][1][0]):
+        x0 = ordered[i][1][0]
+        if last_x is None or x0 - last_x > thr:
+            cols.append([])
+        last_x = x0
+        cols[-1].append(i)
+    for m in cols:
+        m.sort(key=lambda i: ordered[i][1][1])
+    return cols
 
 
 def _radio_for_letter(arr: np.ndarray, lbox: tuple[float, float, float, float]):
@@ -391,19 +415,35 @@ class ExamParser:
         self._crop[idx] = (top, bottom)
         cw, ch = arr.shape[1], bottom - top
 
-        # locate choice letters (A) B) ... up to J)
-        letter_boxes = {}
+        # locate choice letters (A) B) ... up to Z)
+        cands: dict[str, list[list[float]]] = {}
         for w in words:
-            m = re.match(r"^([A-J])\)$", w["text"])
+            # the O of a choice label comes out of some text layers as a zero
+            # (the same glyph the radio circles use)
+            m = re.match(r"^([A-Z0])\)$", w["text"])
             if not m:
                 continue
-            L = m.group(1)
+            L = "O" if m.group(1) == "0" else m.group(1)
             bx = [w["x0"], w["y0"], w["x1"], w["y1"]]
-            # keep the first (topmost) occurrence per letter within content
             if bx[1] < top or bx[3] > bottom:
                 continue
-            if L not in letter_boxes or bx[1] < letter_boxes[L][1]:
-                letter_boxes[L] = bx
+            cands.setdefault(L, []).append(bx)
+        for lst in cands.values():
+            lst.sort(key=lambda b: b[1])
+        # keep the topmost occurrence per letter, but never one above choice
+        # A's own line: "37.0C (98.6F)" in a vitals table hands us an "F)"
+        # token a third of a page above the real choices, and a phantom F both
+        # invents a sixth choice and puts the run out of reading order. A
+        # second column's first label shares A's line, so allow a line of slack.
+        letter_boxes = {}
+        if "A" in cands:
+            a0 = cands["A"][0]
+            floor = a0[1] - (a0[3] - a0[1])
+            for L, lst in cands.items():
+                for bx in lst:
+                    if bx[1] >= floor:
+                        letter_boxes[L] = bx
+                        break
 
         # only keep a contiguous run A, B, C, ...
         ordered = []
@@ -412,17 +452,32 @@ class ExamParser:
             ordered.append((chr(expect), letter_boxes[chr(expect)]))
             expect += 1
 
+        radios = [_radio_for_letter(arr, bx) for _, bx in ordered]
+        cols = _choice_columns(ordered, cw)
+        col_of = {}
+        for ci, members in enumerate(cols):
+            for i in members:
+                col_of[i] = ci
+        col_left = [min(radios[i][0] - radios[i][2] * 1.6 for i in m) for m in cols]
+        col_right = [col_left[ci + 1] - 4 if ci + 1 < len(cols) else cw * 0.99
+                     for ci in range(len(cols))]
+
         choices = []
         for idx, (L, bx) in enumerate(ordered):
-            cx, cy, rad = _radio_for_letter(arr, bx)
-            # row vertical span: from this letter to the next choice letter
+            cx, cy, rad = radios[idx]
+            members = cols[col_of[idx]]
+            pos = members.index(idx)
+            nbx = ordered[members[pos + 1]][1] if pos + 1 < len(members) else None
+            # row vertical span: from this letter to the next one DOWN ITS OWN
+            # COLUMN — with A to E left and F to J right, the next letter after
+            # E is back at the top of the page and the row came out negative
             row_top = bx[1] - rad * 0.6
-            if idx + 1 < len(ordered):
-                row_bot = ordered[idx + 1][1][1] - rad * 0.6
+            if nbx is not None:
+                row_bot = nbx[1] - rad * 0.6
             else:
                 row_bot = bx[3] + (bx[3] - bx[1]) * 1.4
             row_left = cx - rad * 1.6
-            row_right = cw * 0.99
+            row_right = col_right[col_of[idx]]
             row = [row_left / cw, (row_top - top) / ch,
                    row_right / cw, (row_bot - top) / ch]
             radio = [cx / cw, (cy - top) / ch, rad / ch]

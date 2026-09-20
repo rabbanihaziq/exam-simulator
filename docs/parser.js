@@ -32,7 +32,7 @@ function normText(s) {
 function stemKey(text) {
   // the answer key prints a red X before a wrongly answered item's number
   let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*[.)]\s/, " ");
-  t = t.split(/\n\s*[A-J]\)|Correct\s*Answer/)[0];
+  t = t.split(/\n\s*[A-Z]\)|Correct\s*Answer/)[0];
   return normText(t).slice(0, 350);
 }
 
@@ -45,7 +45,7 @@ function itemNumber(text) {
 }
 
 function correctLetter(text) {
-  const m = text.match(/Correct\s*Answer:\s*([A-J])/);
+  const m = text.match(/Correct\s*Answer:\s*([A-Z])/);
   return m ? m[1] : null;
 }
 
@@ -414,18 +414,47 @@ function findTableRuns(lines, cw) {
   return runs.filter((r) => r.length >= 2);
 }
 
+/* Answer choices are not always one column. A ten-choice item prints A to E
+   down the left half and F to J down the right; a seventeen-choice one runs
+   A to I left and J to Q right. Cluster the label boxes by x0 — jitter within
+   one column is a few pixels (the labels are right-aligned, so "I)" starts
+   further right than "M)"), while the step to the next column is most of the
+   page — and return the columns left to right, each with its members in
+   reading order down the page.
+
+   Everything downstream then bounds a choice by its own column: its row ends
+   at the next label in that column (not the next letter, which may be back at
+   the top of the next column) and stops short of the next column's radio. */
+function choiceColumns(ordered, cw) {
+  const thr = Math.max(cw * 0.08, 40);
+  const byX = ordered.map((_, i) => i)
+    .sort((a, b) => ordered[a][1].x0 - ordered[b][1].x0);
+  const cols = [];
+  let cur = null;
+  for (const i of byX) {
+    const x0 = ordered[i][1].x0;
+    if (!cur || x0 - cur.xLast > thr) { cur = { x0, xLast: x0, members: [] }; cols.push(cur); }
+    cur.xLast = x0;
+    cur.members.push(i);
+  }
+  cols.forEach((c) => c.members.sort((a, b) => ordered[a][1].y0 - ordered[b][1].y0));
+  return cols;
+}
+
 /* Build the structured content for one question page: stem paragraphs with
    inline figure crops, plus per-choice text runs. Returns null when the page
    doesn't extract cleanly (caller falls back to image mode). */
 async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
   if (!pxChoices.length) return null;
-  const stemBot = pxChoices[0].rowTop;
-  // The stem ends at choice A's BASELINE, not at the top of its box. A word's
-  // box is y0 = baseline - fontSize, y1 = baseline + 0.25*fontSize, so a last
-  // stem line only a line and a half above choice A failed `y1 <= rowTop` and
-  // vanished from the text render entirely. The choice rows below are already
-  // bounded by baselines for the same reason.
-  const stemLimit = pxChoices[0].base - pxChoices[0].tol;
+  // The topmost choice, not choice A: with the choices in two columns the
+  // right column's first label can sit a few pixels above A's.
+  const stemBot = Math.min(...pxChoices.map((c) => c.rowTop));
+  // The stem ends at the first choice's BASELINE, not at the top of its box.
+  // A word's box is y0 = baseline - fontSize, y1 = baseline + 0.25*fontSize,
+  // so a last stem line only a line and a half above choice A failed
+  // `y1 <= rowTop` and vanished from the text render entirely. The choice rows
+  // below are already bounded by baselines for the same reason.
+  const stemLimit = Math.min(...pxChoices.map((c) => c.base - c.tol));
   const stemWords = raw.filter((w) => w.y0 >= top - 2 && w.base < stemLimit);
   if (stemWords.length < 5) return null;
 
@@ -705,12 +734,20 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     // clear of that choice's own text whatever font it uses, yet still below a
     // wrapped continuation line of this one.
     const from = pc.base - pc.tol;
-    // the last choice runs to the end of the content, never into the footer bar
-    const next = pxChoices[ci + 1];
-    const to = next ? next.base - next.tol : top + ch;
+    // The last choice IN THIS COLUMN runs to the end of the content, never
+    // into the footer bar. nextBase is the next label down the same column:
+    // bounding by the next letter instead gave the bottom choice of a
+    // two-column left column a negative-height band (its "next" letter is the
+    // right column's top one), which emptied it and dropped the item to image
+    // mode. colRight keeps the run out of the neighbouring column.
+    const to = pc.nextBase != null ? pc.nextBase - pc.nextTol : top + ch;
+    const colRight = pc.colRight == null ? Infinity : pc.colRight;
     const cws = raw.filter((w) => {
       if (!(w.base >= from && w.base < to)) return false;
-      if (w.x0 < pc.lx0 - 2 || w.text === pc.letter + ")") return false;
+      if (w.x0 < pc.lx0 - 2 || w.x0 >= colRight) return false;
+      // lw is the label token itself; comparing text would miss the O label,
+      // which some text layers spell "0)"
+      if (w === pc.lw || w.text === pc.letter + ")") return false;
       // a label OCR'd inside the exhibit (an "R" orientation marker on an
       // x-ray) can share a choice's baseline; it belongs to the figure
       const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
@@ -1074,7 +1111,7 @@ const OCR_JUNK = /^[Oo0QJCG©®•()\[\]{}.,_|\-—–\s]+$/;
    choice letter. Keep the last letter before the ")" and pull the box in from
    the left, because the circle occupies the part being dropped. */
 function unfuseChoiceLabel(t) {
-  const m = t.text.match(/^(.{0,3}?)([A-J])\.?\)$/);
+  const m = t.text.match(/^(.{0,3}?)([A-Z])\.?\)$/);
   if (!m || /[a-z]/.test(m[1])) return t;
   const dropped = t.text.length - 2;
   if (!dropped) return t;
@@ -1087,7 +1124,7 @@ function cleanOcrTokens(toks, hdr, takeItemNo) {
   const merged = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    if (/^[A-J]$/.test(t.text) && i + 1 < toks.length && toks[i + 1].text === ")") {
+    if (/^[A-Z]$/.test(t.text) && i + 1 < toks.length && toks[i + 1].text === ")") {
       merged.push({ ...t, text: t.text + ")", x1: toks[i + 1].x1 });
       i++;
     } else merged.push(t);
@@ -1113,7 +1150,15 @@ function cleanOcrTokens(toks, hdr, takeItemNo) {
   // not always readable — a circle touching a C comes back as "(OO" + "€)" —
   // so a short low-confidence token ending in ")" counts as the label here and
   // repairChoiceRun works out which letter it is afterwards.
-  let li = toks.findIndex((t) => /^[A-J]\)$/.test(t.text));
+  let li = toks.findIndex((t) => /^[A-Z]\)$/.test(t.text));
+  // The circle itself reads as a label often enough: an untouched radio comes
+  // back as "O)" or "C)", which the letter range now matches. When a second
+  // label-shaped token follows it in the same breath, the first one is the
+  // circle and the second is the real letter.
+  if (li >= 0 && li <= 1 && OCR_JUNK.test(toks[li].text)) {
+    const nx = toks.findIndex((t, i) => i > li && /^[A-Z]\)$/.test(t.text));
+    if (nx > 0 && nx <= 2) li = nx;
+  }
   if (li < 0) {
     li = toks.findIndex((t) => /^.{0,3}\)$/.test(t.text) &&
                                (t.c === undefined || t.c < 60));
@@ -1139,7 +1184,7 @@ function cleanOcrTokens(toks, hdr, takeItemNo) {
    agreement and the page is left alone. */
 function repairChoiceRun(recs) {
   const head = (r) => r.toks[0];
-  const clean = (t) => /^[A-J]\)$/.test(t.text);
+  const clean = (t) => /^[A-Z]\)$/.test(t.text);
   const good = recs.filter((r) => head(r) && clean(head(r)));
   if (good.length < 2) return;
   const colX = median(good.map((r) => head(r).x0));
@@ -1158,7 +1203,7 @@ function repairChoiceRun(recs) {
     // bracket and starts a circle's width further left.
     if (Math.abs(t.x0 - colX) <= 12) return /^.{0,3}\)$/.test(t.text);
     if (t.x0 > colX - labW * 2 && t.x0 < colX) {
-      return /^[Oo0Q\u00a9\u00ae\u2022(\[]{1,2}[A-J]$/.test(t.text);
+      return /^[Oo0Q\u00a9\u00ae\u2022(\[]{1,2}[A-Z]$/.test(t.text);
     }
     // no label read at all: the line starts at the choice-text column
     return Math.abs(t.x0 - textX) <= 12;
@@ -1269,7 +1314,7 @@ function ocrPageRecord(data, scale, height, hdr) {
   // have been one can go if they are still unreadable
   const L = [];
   for (const r of out) {
-    const toks = r.toks.filter((t) => /^[A-J]\)$/.test(t.text) ||
+    const toks = r.toks.filter((t) => /^[A-Z]\)$/.test(t.text) ||
                                       ((t.c === undefined || t.c >= 25) &&
                                        /[A-Za-z0-9]/.test(t.text)));
     if (!toks.length) continue;
@@ -1298,7 +1343,7 @@ function applyDotChoiceLabels(recs) {
   if (recs.some((r) => r.toks.length && /^A\)$/.test(r.toks[0].text))) return;
   const first = new Map();
   for (const r of recs) {
-    const m = r.toks.length && r.toks[0].text.match(/^([A-J])\.$/);
+    const m = r.toks.length && r.toks[0].text.match(/^([A-Z])\.$/);
     if (m && !first.has(m[1])) first.set(m[1], r.toks[0]);
   }
   const run = [];
@@ -1623,14 +1668,33 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       }
     }
 
-    // choice letters A) B) ... — topmost occurrence per letter in the band
-    const letterBoxes = new Map();
+    // choice letters A) B) ... Q) — topmost occurrence per letter in the band,
+    // and never above choice A's own line: "37.0C (98.6F)" in a vitals table
+    // hands us an "F)" token a third of a page above the real choices, and a
+    // phantom F both invents a sixth choice and puts the run out of reading
+    // order, which used to drop the whole item into image mode.
+    const letterCands = new Map();
     for (const wd of rawWords) {
-      const m = wd.text.match(/^([A-J])\)$/);
+      // the O of a choice label comes out of some text layers as a zero (the
+      // same glyph the radio circles use); every other letter reads cleanly
+      const m = wd.text.match(/^([A-Z0])\)$/);
       if (!m) continue;
       if (wd.y0 < top || wd.y1 > bottom) continue;
-      const L = m[1];
-      if (!letterBoxes.has(L) || wd.y0 < letterBoxes.get(L).y0) letterBoxes.set(L, wd);
+      const L = m[1] === "0" ? "O" : m[1];
+      if (!letterCands.has(L)) letterCands.set(L, []);
+      letterCands.get(L).push(wd);
+    }
+    for (const list of letterCands.values()) list.sort((a, b) => a.y0 - b.y0);
+    const letterBoxes = new Map();
+    const aList = letterCands.get("A");
+    if (aList) {
+      // a second column's first label shares choice A's baseline, so the floor
+      // is a line's worth above it, not A's baseline exactly
+      const floor = aList[0].base - (aList[0].y1 - aList[0].y0);
+      for (const [L, list] of letterCands) {
+        const b = list.find((wd) => wd.base >= floor);
+        if (b) letterBoxes.set(L, b);
+      }
     }
     const ordered = [];
     let code = 65;
@@ -1641,18 +1705,36 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
 
     const choices = [];
     const pxChoices = [];
+    // Radios first: a column's right edge is the next column's leftmost radio.
+    const radios = ordered.map(([, bx]) =>
+      radioForLetter(img.data, w, h, [bx.x0, bx.y0, bx.x1, bx.y1]));
+    const cols = choiceColumns(ordered, cw);
+    const colOf = [];
+    cols.forEach((c, ci) => c.members.forEach((i) => { colOf[i] = ci; }));
+    cols.forEach((c) => {
+      c.left = Math.min(...c.members.map((i) => radios[i][0] - radios[i][2] * 1.6));
+    });
+    cols.forEach((c, ci) => {
+      c.right = ci + 1 < cols.length ? cols[ci + 1].left - 4 : cw * 0.99;
+    });
     ordered.forEach(([L, bx], idx) => {
-      const [cx, cy, rad] = radioForLetter(img.data, w, h, [bx.x0, bx.y0, bx.x1, bx.y1]);
+      const [cx, cy, rad] = radios[idx];
+      const col = cols[colOf[idx]];
+      // the next choice DOWN THIS COLUMN, not the next letter: with A to E
+      // left and F to J right, E's row ended at F's top, a row above it
+      const nx = col.members[col.members.indexOf(idx) + 1];
+      const nbx = nx === undefined ? null : ordered[nx][1];
       const rowTop = bx.y0 - rad * 0.6;
-      const rowBot = idx + 1 < ordered.length
-        ? ordered[idx + 1][1].y0 - rad * 0.6
-        : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      const rowBot = nbx ? nbx.y0 - rad * 0.6 : bx.y1 + (bx.y1 - bx.y0) * 1.4;
       // cx/cy/rad let extendFiguresBelow mask the radio circles, the only ink
       // below the stem that no text box covers
       pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0, lx1: bx.x1,
-                       base: bx.base, tol: (bx.y1 - bx.y0) * 0.4, cx, cy, rad });
+                       base: bx.base, tol: (bx.y1 - bx.y0) * 0.4, cx, cy, rad,
+                       lw: bx, colRight: col.right,
+                       nextBase: nbx ? nbx.base : null,
+                       nextTol: nbx ? (nbx.y1 - nbx.y0) * 0.4 : null });
       const rowLeft = cx - rad * 1.6;
-      const rowRight = cw * 0.99;
+      const rowRight = col.right;
       choices.push({
         letter: L,
         row: [rowLeft / cw, (rowTop - top) / ch, rowRight / cw, (rowBot - top) / ch]

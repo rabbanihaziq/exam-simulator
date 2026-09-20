@@ -41,6 +41,22 @@ Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 | `summary.txt` | item/keyed/text-mode/figure counts, wall-clock parse time, a one-line-per-item table, and anything the page logged to the console |
 | `progress.txt` | every `onProgress(label, frac)` the parse emitted |
 
+## Selection test
+
+```sh
+node tests/harness/select.mjs "<questions.pdf>" "<answers.pdf>" 6,8,14
+```
+
+Loads the real exam page (`docs/index.html`), parses the PDFs, boots the exam
+and clicks — with Chrome's own mouse — the centre of every listed item's
+choice radios in turn, asserting the exam recorded the letter that was
+clicked. Each item is driven twice, once through the reflowed text choices and
+once through the positioned overlay rows (the image-mode path, forced by
+clearing `content`). It also checks that every `row` rect has positive area,
+that no row contains another choice's radio centre, and that rows sharing a
+column don't overlap. Exits non-zero on any failure. This is the regression
+test for two-column choice grids.
+
 ## Diffing a change
 
 Keep a baseline directory, rerun into a second directory, then compare

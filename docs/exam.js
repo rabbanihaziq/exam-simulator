@@ -362,9 +362,12 @@ function makeChoiceEl(it, c, w, h) {
   // through the vertical center of the option text (= radio center), from
   // just past the radio to the end of the option's words
   st.style.top = ((c.radio[1] - c.row[1]) * h - 1) + "px";
+  // bounded in x as well as y: with the choices in two columns a left-column
+  // row shares its band with the right column, and a y-only filter ran the
+  // strike line straight across the choice beside it
   const rowWords = it.words.filter((wd) => {
-    const cy = (wd[1] + wd[3]) / 2;
-    return cy >= c.row[1] && cy <= c.row[3];
+    const cy = (wd[1] + wd[3]) / 2, cx = (wd[0] + wd[2]) / 2;
+    return cy >= c.row[1] && cy <= c.row[3] && cx >= c.row[0] && cx <= c.row[2];
   });
   if (rowWords.length) {
     const leftPx = (c.radio[0] * w + c.radio[2] * h * 1.6) - c.row[0] * w;
@@ -806,7 +809,7 @@ function wireChrome() {
   document.querySelectorAll("[data-close]").forEach((x) =>
     x.addEventListener("click", closeModal));
 
-  // keyboard: arrows navigate, A-J select, 1-9 select, M marks, Esc closes
+  // keyboard: arrows navigate, A-Z select, 1-9 select, M marks, Esc closes
   window.addEventListener("keydown", (e) => {
     if (document.querySelector(".modal-back.open")) {
       if (e.key === "Escape") closeModal();
@@ -823,7 +826,7 @@ function wireChrome() {
       const L = e.key.toUpperCase();
       const letters = it.content ? it.content.choices.map((c) => c.letter)
                                  : it.choices.map((c) => c.letter);
-      if (/^[A-J]$/.test(L) && letters.includes(L)) selectChoice(L);
+      if (/^[A-Z]$/.test(L) && letters.includes(L)) selectChoice(L);
       else if (/^[1-9]$/.test(e.key)) {
         const c = letters[parseInt(e.key, 10) - 1];
         if (c) selectChoice(c);
@@ -1132,7 +1135,7 @@ function renderExplanation(info) {
     // the key's lead line is sometimes its own paragraph ("Correct Answer: A.")
     // and sometimes runs straight on into the discussion; only the lead line
     // itself should get the green heading treatment.
-    const lead = /^(Correct Answer\s*:\s*[A-J]\s*\.?)([\s\S]*)$/.exec(p);
+    const lead = /^(Correct Answer\s*:\s*[A-Z]\s*\.?)([\s\S]*)$/.exec(p);
     if (lead) {
       const rest = lead[2].trim();
       return `<p class="ans-correct">${escHtml(lead[1])}</p>` +

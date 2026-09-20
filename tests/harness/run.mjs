@@ -228,6 +228,8 @@ const items = await page.evaluate(() => window.DATA.items.map((it, i) => ({
   aspect: it.aspect,
   n_words: it.words.length,
   n_choices: it.choices.length,
+  // choice geometry (row rect + radio) so a layout regression is diffable
+  rows: it.choices.map((c) => ({ letter: c.letter, row: c.row, radio: c.radio })),
   stem: it.content
     ? it.content.blocks.filter((b) => b.t === "p").map((b) => window.__runsText(b.runs))
     : null,
