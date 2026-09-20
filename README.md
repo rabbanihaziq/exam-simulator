@@ -23,11 +23,14 @@ with a modern browser (Chrome recommended).
 - **Take the exam** — click through items, select answers (click a choice, or
   press `A`–`J` / `1`–`9`), a live countdown timer, **Mark** items for review.
 - **Highlight like a browser** — select text with your mouse to lay down
-  yellow highlights; click a highlight to remove it, or **Clear** the item.
-  Right-click a choice to strike it out.
-- **Lab Values** — a standard reference table (Serum, Hematologic, CSF,
-  Urine/BMI) with search and an SI-units toggle.
-- **Calculator** and an **Item Navigator** grid (answered / marked / no-key).
+  yellow highlights; click a highlight to remove it, or clear the item from
+  **Settings**. Click the "ab" glyph beside a choice (or right-click it) to
+  strike it out.
+- **Lab Values** — a reference panel docked beside the question (Serum,
+  Cerebrospinal, Blood, Urine and BMI) with search and an SI-units toggle,
+  laid out like the real exam client.
+- **Calculator**, **Notes**, and a **Question Status** sidebar (answered /
+  marked / no-key) that mirrors the real NBME layout.
 - **Submit → review** — **End Block** scores you against the answer key and
   shows each item's answer-key page (correct answer + full explanation) with a
   *Your answer vs Correct* banner and a **% correct**.
@@ -48,6 +51,27 @@ with a modern browser (Chrome recommended).
 - Correct answers are matched to questions by item number with a text
   similarity cross-check, so an occasional glitch in a page header won't
   mis-score you.
+
+## Image-only (flat screenshot) PDFs
+
+Some share PDFs are one screenshot per page with no text layer at all, so
+there is nothing for a parser to read — no item headers, no choices, no key.
+
+- **In the browser**, this is handled for you: the web app recognises an
+  image-only PDF and OCRs it on the spot. Just drop the raw files in.
+- **Offline** (the Windows app, the Flask app, `app/parsing/parser.py`), run
+  the PDFs through `tools/ocr_layer/ocr_pdf.py` first. It writes an invisible
+  text layer over the screenshots, and the rest of the pipeline then works
+  unchanged:
+
+  ```bash
+  python tools/ocr_layer/ocr_pdf.py "Surgery 7 - Questions.pdf"   # -> "... (OCR).pdf"
+  python tools/ocr_layer/ocr_pdf.py "Surgery 7 - Answers.pdf"
+  ```
+
+  `--check` tells you whether a given PDF needs it at all. See
+  [tools/ocr_layer/README.md](tools/ocr_layer/README.md) for install steps
+  (Apple Vision on macOS, Tesseract on Windows) and the full option list.
 
 ## Offline / local versions
 

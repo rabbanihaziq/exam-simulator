@@ -8,11 +8,11 @@
 <style>
   /* ---------- landing ---------- */
   #landing { position:fixed; inset:0; background:#eef1f5; overflow:auto; z-index:20; }
-  #landing .topstripe { background:#1b3a67; height:6px; }
+  #landing .topstripe { background:#1c4873; height:6px; }
   .wrap { max-width:720px; margin:6vh auto; padding:0 20px; }
   .card { background:#fff; border-radius:12px; box-shadow:0 6px 30px rgba(20,40,70,.12);
           padding:34px 38px; }
-  .card h1 { margin:0 0 4px; font-size:26px; color:#1b3a67; letter-spacing:.2px; }
+  .card h1 { margin:0 0 4px; font-size:26px; color:#1c4873; letter-spacing:.2px; }
   .card .sub { color:#5a6b7d; margin:0 0 26px; font-size:15px; }
   .card label.f { display:block; font-weight:600; margin:18px 0 7px; font-size:14px; }
   .card .hint { font-weight:400; color:#7a8794; font-size:12.5px; }
@@ -24,17 +24,19 @@
   .drop .ic { font-size:26px; }
   .drop .txt { font-size:14px; color:#42566a; }
   .drop .txt b { color:#1c2733; }
+  .ocr-note { font-size:12.5px; color:#6b7a8a; margin:11px 2px 0; line-height:1.5; }
   .card .row { display:flex; gap:22px; align-items:flex-end; margin-top:22px; flex-wrap:wrap; }
   .minutes { width:130px; }
   .minutes input { width:100%; padding:9px 11px; border:1px solid #c3cedb; border-radius:7px;
                    font-size:15px; }
-  button.start { margin-top:28px; width:100%; background:#1b3a67; color:#fff; border:none;
+  button.start { margin-top:28px; width:100%; background:#1c4873; color:#fff; border:none;
           padding:14px; font-size:16px; font-weight:600; border-radius:8px; cursor:pointer;
           letter-spacing:.3px; }
-  button.start:hover { background:#16305a; }
+  button.start:hover { background:#16385c; }
   button.start:disabled { background:#9aa8b8; cursor:not-allowed; }
   .err { background:#fdecec; color:#8b0000; border:1px solid #f3c4c4; padding:11px 14px;
-         border-radius:8px; font-size:14px; margin:0 0 18px; display:none; }
+         border-radius:8px; font-size:14px; margin:0 0 18px; display:none;
+         line-height:1.55; white-space:normal; overflow-wrap:anywhere; }
   .foot { color:#8593a2; font-size:12px; margin-top:22px; line-height:1.6; }
   .foot b { color:#5a6b7d; }
   #progressWrap { display:none; margin-top:26px; }
@@ -69,6 +71,9 @@
         <input type="file" id="file-a" accept="application/pdf">
       </label>
 
+      <p class="ocr-note">Flat, image-only PDFs (screenshot exports) are recognized automatically
+        in your browser; the first load takes a minute or two.</p>
+
       <div class="row">
         <div class="minutes">
           <label class="f" style="margin-top:0">Time limit (min)</label>
@@ -90,8 +95,8 @@
       <div class="foot">
         Everything runs right here in your browser — the PDFs are parsed on your computer and
         <b>never uploaded anywhere</b>. In the exam you can <b>select text to highlight</b> it,
-        open <b>Lab Values</b> and the <b>Calculator</b>, mark items for review, and jump around
-        with the navigator.
+        open <b>Lab Values</b>, <b>Notes</b> and the <b>Calculator</b>, mark items for review,
+        and jump around with the Question Status list.
       </div>
     </div>
   </div>
@@ -99,109 +104,184 @@
 
 <!-- ================= exam ================= -->
 <div id="app" style="display:none">
-  <div id="topred"></div>
 
+  <!-- ---------- left rail: question status (full window height) ---------- -->
+  <div id="sidebar">
+    <div class="sbhead">Question<br>Status</div>
+    <div id="sblist"></div>
+  </div>
+
+  <div id="stack">
+
+  <!-- ---------- top bar ---------- -->
   <div id="topbar">
-    <div class="seg left">
-      <div class="itemno">Exam Section: Item <span id="curno">1</span> of <span id="total">50</span></div>
-      <label class="mark" id="markLbl"><input type="checkbox" id="markChk"> Mark</label>
+    <div class="tb-left">
+      <div class="itembox">
+        <div>Item: <span id="curno">1</span> of <span id="total">50</span></div>
+        <div>Block: <span id="blockNo">1</span> of 1</div>
+      </div>
+      <div class="examtitle" id="examTitle">Self-Assessment</div>
     </div>
-    <div class="seg mid">
-      <div class="title2" id="examTitle">Self-Assessment</div>
+
+    <div class="tb-mid">
+      <button class="navbtn" id="prevBtn" title="Previous item (left arrow)">
+        <span class="circ"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12H5M11 6l-6 6 6 6"/></svg></span>
+        <span class="lbl">Previous</span>
+      </button>
+      <div class="counter"><span id="counterNow">1</span> / <span id="counterTot">50</span></div>
+      <button class="navbtn" id="nextBtn" title="Next item (right arrow)">
+        <span class="circ"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg></span>
+        <span class="lbl">Next</span>
+      </button>
     </div>
-    <div class="seg right">
-      <div class="tlabel">Time Remaining</div>
-      <div class="timer" id="timer">--:--</div>
+
+    <div class="tb-right">
+      <button class="tool" id="labBtn" title="Lab Values">
+        <span class="sq"><svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 2.6h6M10.2 2.6v6.9L5 18.4A1.9 1.9 0 0 0 6.6 21.3h10.8a1.9 1.9 0 0 0 1.6-2.9l-5.2-8.9V2.6"
+                fill="none" stroke="#17324f" stroke-width="1.8" stroke-linejoin="round"/>
+          <path d="M7.4 15.2h9.2" stroke="#17324f" stroke-width="1.8"/></svg></span>
+        <span class="lbl">Lab Values</span>
+      </button>
+      <button class="tool" id="notesBtn" title="Notes">
+        <span class="sq"><svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.6 20.4l1.1-4.3L15.9 4.9a1.9 1.9 0 0 1 2.7 0l.5.5a1.9 1.9 0 0 1 0 2.7L7.9 19.3l-4.3 1.1z"
+                fill="#17324f"/><path d="M14.4 6.4l3.2 3.2" stroke="#fff" stroke-width="1.5"/></svg></span>
+        <span class="lbl">Notes</span>
+      </button>
+      <button class="tool" id="calcBtn" title="Calculator">
+        <span class="sq"><svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="4.2" y="2.4" width="15.6" height="19.2" rx="1.8" fill="none" stroke="#17324f" stroke-width="1.8"/>
+          <rect x="6.8" y="5" width="10.4" height="3.4" fill="#17324f"/>
+          <g fill="#17324f"><rect x="6.8" y="10.4" width="2.6" height="2.3"/>
+          <rect x="10.7" y="10.4" width="2.6" height="2.3"/><rect x="14.6" y="10.4" width="2.6" height="2.3"/>
+          <rect x="6.8" y="14.4" width="2.6" height="2.3"/><rect x="10.7" y="14.4" width="2.6" height="2.3"/>
+          <rect x="14.6" y="14.4" width="2.6" height="2.3"/>
+          <rect x="6.8" y="18.1" width="6.5" height="2.3"/><rect x="14.6" y="18.1" width="2.6" height="2.3"/></g></svg></span>
+        <span class="lbl">Calculator</span>
+      </button>
+      <button class="tool" id="setBtn" title="Settings">
+        <span class="sq"><svg viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="#17324f" d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8zm8.5 4.3v-1.8l-2.1-.5a6.7 6.7 0 0 0-.7-1.6l1.1-1.8-1.3-1.3-1.8 1.1a6.7 6.7 0 0 0-1.6-.7l-.5-2.1h-1.8l-.5 2.1a6.7 6.7 0 0 0-1.6.7L8 5.9 6.7 7.2l1.1 1.8a6.7 6.7 0 0 0-.7 1.6l-2.1.5v1.8l2.1.5c.16.57.4 1.1.7 1.6l-1.1 1.8 1.3 1.3 1.8-1.1c.5.3 1 .54 1.6.7l.5 2.1h1.8l.5-2.1c.57-.16 1.1-.4 1.6-.7l1.8 1.1 1.3-1.3-1.1-1.8c.3-.5.54-1 .7-1.6z"/></svg>
+          <i class="caret"></i></span>
+        <span class="lbl">Settings</span>
+      </button>
+
+      <div class="dropdown" id="setMenu">
+        <button class="ditem" id="clearHlBtn">Clear highlights on this item</button>
+        <button class="ditem" id="hlBtn">Highlighting: <b id="hlLabel">on</b></button>
+        <button class="ditem" id="timerBtn">Timer: <b id="timerLabel">shown</b></button>
+      </div>
     </div>
   </div>
 
+  <!-- ---------- review bar (after End Block) ---------- -->
   <div id="reviewbar" style="display:none">
-    <div><span class="score" id="scoreBig">0%</span></div>
-    <div class="sub" id="scoreSub"></div>
-    <div class="spacer" style="flex:1"></div>
+    <span class="score" id="scoreBig">0%</span>
+    <span class="sub" id="scoreSub"></span>
+    <span class="spacer"></span>
+    <span class="fbrand" id="brand"></span>
     <button class="btn ghost" id="exportBtn">Export results</button>
     <button class="btn ghost" id="exitReview">Back to exam</button>
     <button class="btn primary" id="newExam">New exam</button>
   </div>
 
-  <div id="content">
-    <div id="unavail">⚠︎ The answer key did not include this item — it won't be scored.</div>
-    <div id="qhtml" class="qhtml" style="display:none"></div>
-    <div id="stage">
-      <img id="qimg" alt="question">
-      <div id="overlay"></div>
-    </div>
-  </div>
+  <!-- ---------- main row: content | lab panel ---------- -->
+  <div id="main">
+    <div id="centre">
+      <div id="content">
+        <div id="unavail">⚠︎ The answer key did not include this item — it won't be scored.</div>
 
-  <div id="reviewwrap" style="display:none">
-    <div class="resultstrip" id="resultstrip"></div>
-    <div id="rhtml" class="qhtml rcard" style="display:none"></div>
-    <div id="rstage">
-      <img id="rimg" alt="question">
-      <div id="roverlay"></div>
-    </div>
-    <div class="expl" id="expl" style="display:none"></div>
-    <div id="origWrap" style="display:none">
-      <button id="origBtn">Show original answer-key page</button>
-    </div>
-    <img id="reviewimg" alt="answer" style="display:none">
-    <div class="na-note" id="naNote" style="display:none"></div>
-  </div>
+        <label class="markrow" id="markLbl">
+          <input type="checkbox" id="markChk">
+          <svg class="flagic" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 2.6v18.8" stroke="#3a3a3a" stroke-width="1.7" fill="none"/>
+            <path d="M7.2 3.3h11.4l-2.7 4.2 2.7 4.2H7.2z" fill="#d42121"/></svg>
+          <span>Mark Question</span>
+        </label>
 
-  <div id="footbar">
-    <button class="fbtn" id="prevBtn"><span class="ic">◀</span>Previous</button>
-    <button class="fbtn" id="nextBtn"><span class="ic">▶</span>Next</button>
-    <button class="fbtn" id="hlBtn"><span class="ic">🖊</span><span id="hlLabel">Highlight</span></button>
-    <button class="fbtn" id="clearHlBtn"><span class="ic">⌫</span>Clear</button>
-    <div class="spacer"></div>
-    <div class="fbrand" id="brand"></div>
-    <div class="spacer"></div>
-    <button class="fbtn" id="labBtn"><span class="ic">🧪</span>Lab Values</button>
-    <button class="fbtn" id="calcBtn"><span class="ic">🧮</span>Calculator</button>
-    <button class="fbtn nav" id="navBtn"><span class="ic">▦</span>Navigator</button>
-    <button class="fbtn end" id="endBtn"><span class="ic">■</span>End Block</button>
-  </div>
-</div>
+        <div id="qhtml" class="qhtml" style="display:none"></div>
+        <div id="stage">
+          <img id="qimg" alt="question">
+          <div id="overlay"></div>
+        </div>
+        <div id="proceedWrap"><button id="proceedBtn">Proceed to Next Item</button></div>
+      </div>
 
-<!-- Lab Values modal -->
-<div class="modal-back" id="labModal">
-  <div class="modal">
-    <div class="mhead">
-      <span>Laboratory Reference Values</span>
-      <label class="si-toggle"><input type="checkbox" id="siToggle"> Show SI units</label>
-      <span class="x" data-close>×</span>
-    </div>
-    <div class="labtabs" id="labTabs"></div>
-    <div class="labsearch"><input type="text" id="labSearch" placeholder="Search a test (e.g. sodium, TSH, hematocrit)…"></div>
-    <div class="mbody" id="labBody" style="width:820px;max-width:90vw;height:60vh"></div>
-  </div>
-</div>
+      <div id="reviewwrap" style="display:none">
+        <div class="resultstrip" id="resultstrip"></div>
+        <div id="rhtml" class="qhtml rcard" style="display:none"></div>
+        <div id="rstage">
+          <img id="rimg" alt="question">
+          <div id="roverlay"></div>
+        </div>
+        <div class="expl" id="expl" style="display:none"></div>
+        <div id="origWrap" style="display:none">
+          <button id="origBtn">Show original answer-key page</button>
+        </div>
+        <img id="reviewimg" alt="answer" style="display:none">
+        <div class="na-note" id="naNote" style="display:none"></div>
+      </div>
 
-<!-- Calculator modal -->
-<div class="modal-back" id="calcModal">
-  <div class="modal">
-    <div class="mhead"><span>Calculator</span><span class="x" data-close>×</span></div>
-    <div class="mbody">
-      <div class="calc-disp" id="calcDisp">0</div>
-      <div class="calc-grid" id="calcGrid"></div>
-    </div>
-  </div>
-</div>
+      <!-- Lab Values, docked to the right of the content area -->
+      <div id="labPanel">
+        <button class="panel-x" id="labClose" title="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 5.5l13 13M18.5 5.5l-13 13"/></svg>
+        </button>
+        <div class="labtop">
+          <input type="text" id="labSearch" placeholder="Search">
+          <label class="si-toggle"><input type="checkbox" id="siToggle"> SI Reference Intervals</label>
+        </div>
+        <div class="labtabs" id="labTabs"></div>
+        <div class="labbody" id="labBody"></div>
+      </div>
 
-<!-- Navigator modal -->
-<div class="modal-back" id="navModal">
-  <div class="modal">
-    <div class="mhead"><span>Item Navigator</span><span class="x" data-close>×</span></div>
-    <div class="mbody">
-      <div class="navgrid" id="navGrid"></div>
-      <div class="navlegend">
-        <span><i class="sw" style="background:#dcecff"></i> Answered</span>
-        <span><i class="sw" style="background:#fff;border-color:#cdd7e2"></i> Unanswered</span>
-        <span><i class="sw" style="background:#fff;position:relative">
-          <i style="position:absolute;top:0;right:0;border-top:8px solid #e6b800;border-left:8px solid transparent"></i></i> Marked</span>
-        <span><i class="sw" style="background:#f4f4f4"></i> No answer key</span>
+      <div id="pauseOverlay">
+        <div class="pausecard"><div class="pw">Paused</div>
+          <div class="ps">Click anywhere, or the Pause button, to resume.</div></div>
       </div>
     </div>
+  </div>
+
+  <!-- ---------- bottom bar ---------- -->
+  <div id="footbar">
+    <div class="timebox" id="timer">
+      <div>Block Time Remaining: <span id="blockTime">--:--</span></div>
+      <div>Day Time Remaining: <span id="dayTime">--:--</span></div>
+    </div>
+    <div class="spacer"></div>
+    <button class="fbtn" id="pauseBtn">
+      <span class="circ light"><svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="8" y="6" width="3.2" height="12" rx=".7" fill="#111"/>
+        <rect x="12.8" y="6" width="3.2" height="12" rx=".7" fill="#111"/></svg></span>
+      <span class="lbl" id="pauseLabel">Pause</span>
+    </button>
+    <div class="spacer"></div>
+    <button class="fbtn end" id="endBtn">
+      <span class="circ red"><svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7.5 7.5l9 9M16.5 7.5l-9 9" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/></svg></span>
+      <span class="lbl">End Block</span>
+    </button>
+  </div>
+
+  </div><!-- /#stack -->
+</div>
+
+<!-- Calculator: small floating panel -->
+<div class="floatpanel" id="calcPanel">
+  <div class="fphead" data-drag="calcPanel"><span>Calculator</span><span class="x" data-fpclose="calcPanel">×</span></div>
+  <div class="fpbody">
+    <div class="calc-disp" id="calcDisp">0</div>
+    <div class="calc-grid" id="calcGrid"></div>
+  </div>
+</div>
+
+<!-- Notes: small floating panel -->
+<div class="floatpanel" id="notesPanel">
+  <div class="fphead" data-drag="notesPanel"><span>Notes</span><span class="x" data-fpclose="notesPanel">×</span></div>
+  <div class="fpbody">
+    <textarea id="notesText" spellcheck="false"
+      placeholder="Scratch notes for this exam — saved in your browser."></textarea>
   </div>
 </div>
 

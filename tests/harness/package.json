@@ -1,0 +1,10 @@
+{
+  "name": "exam-parser-harness",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Headless-Chrome harness that runs docs/parser.js on real PDFs and dumps items.json, figure crops and side-by-side previews.",
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}

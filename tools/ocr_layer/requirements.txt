@@ -1,0 +1,12 @@
+# OCR text layer for image-only (flat screenshot) exam PDFs.
+#   pip install -r tools/ocr_layer/requirements.txt
+
+pymupdf>=1.24
+pillow>=10.0
+numpy>=1.24
+
+# macOS only: the Apple Vision engine (--engine vision).  Ignored elsewhere;
+# on Windows/Linux the tool uses the tesseract CLI instead, which is installed
+# separately (see README.md).
+pyobjc-framework-Vision>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0 ; sys_platform == "darwin"

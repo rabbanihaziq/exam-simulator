@@ -1,9 +1,11 @@
 "use strict";
 /* self-assessment exam front-end (fully client-side version).
    The landing screen takes the two PDFs, parser.js parses them in the
-   browser, and the exam interface renders question images with an
-   interactive overlay: native text-selection highlighting, click-to-answer,
-   lab values, calculator, navigator, timer, and a scored review. */
+   browser, and the exam interface reproduces the real NBME/Pearson
+   delivery chrome: a Question Status rail, a navy top bar with the
+   Lab Values / Notes / Calculator / Settings tools, the stem and a
+   bordered choice box in the content area, and a navy bottom bar with
+   the block/day clocks, Pause and End Block. */
 
 let DATA = null;              // parseExam() result
 let cur = 0;                  // current item index (0-based)
@@ -15,6 +17,7 @@ const S = {                   // persisted session state
   highlights: {},             // item -> [ [x0,y0,x1,y1], ... ] (image mode)
   hlw: {},                    // item -> [wordId, ...]        (text mode)
   startedAt: null,
+  notes: "",                  // free-text scratch pad
 };
 
 const $ = (id) => document.getElementById(id);
@@ -126,21 +129,75 @@ function boot(data) {
   LSKEY = "sa_exam_" + DATA.sid;  // isolate saved state per exam file
   loadState();
   S.hlw = S.hlw || {};            // state saved by older versions lacks this
-  $("examTitle").textContent = DATA.title || "Self-Assessment";
-  document.title = DATA.title || "Self-Assessment";
-  $("brand").textContent = DATA.title || "";
+  if (typeof S.notes !== "string") S.notes = "";
+  const title = DATA.title || "Self-Assessment";
+  $("examTitle").textContent = title;
+  document.title = title;
+  $("brand").textContent = title;
   $("total").textContent = DATA.count;
+  $("counterTot").textContent = DATA.count;
   if (!S.startedAt) { S.startedAt = Date.now(); saveState(); }
+  buildSidebar();
   buildLab();
   buildCalc();
+  $("notesText").value = S.notes;
   wireChrome();
   startTimer();
   showItem(0);
   $("prevBtn").onclick = () => reviewing ? showReview(cur - 1) : showItem(cur - 1);
   $("nextBtn").onclick = () => reviewing ? showReview(cur + 1) : showItem(cur + 1);
+  $("proceedBtn").onclick = () => showItem(cur + 1);
 }
 
 function item(i) { return DATA.items[i]; }
+
+/* ------------------------------------------------------------------ */
+/* Question Status rail                                                */
+/* ------------------------------------------------------------------ */
+const FLAG_SVG =
+  '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+  '<path d="M6 2.5v19" stroke="#c01c1c" stroke-width="2.6" fill="none"/>' +
+  '<path d="M7.4 3.2h12l-2.9 4.3 2.9 4.3h-12z" fill="#d42121"/></svg>';
+
+function buildSidebar() {
+  const list = $("sblist");
+  list.innerHTML = "";
+  DATA.items.forEach((it, i) => {
+    const row = document.createElement("div");
+    row.className = "sbrow";
+    row.dataset.i = i;
+    row.innerHTML = '<span class="dot"></span><span class="num">' + it.item +
+      '</span><span class="flag">' + FLAG_SVG + "</span>";
+    row.onclick = () => { if (paused) return; reviewing ? showReview(i) : showItem(i); };
+    list.appendChild(row);
+  });
+  updateSidebar();
+}
+
+function updateSidebar() {
+  const rows = $("sblist").children;
+  for (let i = 0; i < rows.length; i++) {
+    const it = DATA.items[i], r = rows[i];
+    const your = S.answers[it.item];
+    r.classList.toggle("answered", !!your);
+    r.classList.toggle("marked", !!S.marks[it.item]);
+    r.classList.toggle("unavail", !it.answer_available);
+    r.classList.toggle("current", i === cur);
+    r.classList.remove("r-correct", "r-wrong", "r-skip", "r-none");
+    if (reviewing) {
+      r.classList.add(!it.answer_available ? "r-none"
+        : !your ? "r-skip"
+        : your === it.correct ? "r-correct" : "r-wrong");
+    }
+  }
+  const row = rows[cur];
+  if (row) {
+    const sb = $("sidebar");
+    const top = row.offsetTop, bot = top + row.offsetHeight;
+    if (top < sb.scrollTop) sb.scrollTop = top - 40;
+    else if (bot > sb.scrollTop + sb.clientHeight) sb.scrollTop = bot - sb.clientHeight + 40;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* render a question                                                   */
@@ -149,17 +206,17 @@ function showItem(i) {
   cur = Math.max(0, Math.min(DATA.count - 1, i));
   const it = item(cur);
   $("curno").textContent = it.item;
+  $("counterNow").textContent = it.item;
   $("markChk").checked = !!S.marks[it.item];
-  $("markLbl").classList.toggle("on", !!S.marks[it.item]);
   $("prevBtn").disabled = cur === 0;
   $("nextBtn").disabled = cur === DATA.count - 1;
+  $("proceedBtn").style.visibility = cur === DATA.count - 1 ? "hidden" : "visible";
   $("unavail").style.display = it.answer_available ? "none" : "block";
 
   if (it.content) {
     $("stage").style.display = "none";
     $("qhtml").style.display = "block";
     renderQuestionHtml(it, $("qhtml"), false);
-    $("content").scrollTop = 0;
   } else {
     $("qhtml").style.display = "none";
     $("stage").style.display = "block";
@@ -169,6 +226,8 @@ function showItem(i) {
     img.src = DATA.qURLs[cur];
     if (img.complete && img.naturalWidth) layoutItem(it);
   }
+  $("content").scrollTop = 0;
+  updateSidebar();
   saveState();
 }
 
@@ -214,8 +273,10 @@ function renderQuestionHtml(it, container, review) {
     return `<div class="${cls.join(" ")}" data-letter="${c.letter}">` +
       (review ? `<span class="cmark"></span>` : "") +
       `<span class="cradio"><span class="cdot"></span></span>` +
-      `<span class="clab">${c.letter})</span>` +
-      `<span class="ctext">${renderRuns(c.runs, hlSet)}</span></div>`;
+      `<span class="cbody"><span class="clab">${c.letter}.</span> ` +
+      `<span class="ctext">${renderRuns(c.runs, hlSet)}</span></span>` +
+      (review ? "" : `<span class="cstrike" title="Cross out this option">ab</span>`) +
+      `</div>`;
   }).join("") + `</div>`;
   container.innerHTML = html;
   container.classList.toggle("hl-mode", hlOn && !review);
@@ -397,6 +458,7 @@ function selectChoice(letter) {
     ? document.querySelectorAll("#qhtml .copt")
     : overlay().querySelectorAll(".choice");
   sel.forEach((el) => el.classList.toggle("sel", el.dataset.letter === letter));
+  updateSidebar();
   saveState();
 }
 function toggleStrike(letter) {
@@ -523,54 +585,161 @@ function clearHighlights() {
 }
 
 /* ------------------------------------------------------------------ */
-/* timer                                                               */
+/* timer: block clock + a cosmetic "day" clock 15 minutes longer       */
 /* ------------------------------------------------------------------ */
 let timerInt = null;
-function startTimer() {
+let paused = false;
+let timerShown = true;
+const DAY_ALLOWANCE = 15 * 60;   // seconds
+
+function hms(sec) {
+  const hh = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60), ss = sec % 60;
+  return (hh ? hh + ":" : "") + (hh ? String(mm).padStart(2, "0") : String(mm)) +
+    ":" + String(ss).padStart(2, "0");
+}
+function blockLeft() {
   const total = (DATA.minutes || 0) * 60;
-  const t = $("timer");
-  if (!total) { t.textContent = "Off"; return; }
-  function tick() {
-    const elapsed = Math.floor((Date.now() - S.startedAt) / 1000);
-    let left = total - elapsed;
-    if (left < 0) left = 0;
-    const hh = Math.floor(left / 3600), mm = Math.floor((left % 3600) / 60),
-          ss = left % 60;
-    t.textContent = (hh ? hh + " hr " : "") +
-      String(mm).padStart(2, "0") + " min " + String(ss).padStart(2, "0") + " sec";
-    t.classList.toggle("warn", left <= 300 && left > 60);
-    t.classList.toggle("crit", left <= 60);
+  if (!total) return null;
+  return Math.max(0, total - Math.floor((Date.now() - S.startedAt) / 1000));
+}
+function tickTimer() {
+  const box = $("timer");
+  const left = blockLeft();
+  if (left === null) {
+    $("blockTime").textContent = "Untimed";
+    $("dayTime").textContent = "Untimed";
+    box.classList.remove("warn", "crit");
+    return;
   }
-  tick();
-  timerInt = setInterval(tick, 1000);
+  $("blockTime").textContent = hms(left);
+  $("dayTime").textContent = hms(left + DAY_ALLOWANCE);
+  box.classList.toggle("warn", left <= 300 && left > 60);
+  box.classList.toggle("crit", left <= 60);
+}
+function startTimer() {
+  if (timerInt) clearInterval(timerInt);
+  tickTimer();
+  if (blockLeft() !== null) timerInt = setInterval(tickTimer, 1000);
+}
+function setPaused(on) {
+  if (on === paused) return;
+  paused = on;
+  if (on) {
+    if (timerInt) { clearInterval(timerInt); timerInt = null; }
+    window._pauseAt = Date.now();
+    $("pauseOverlay").classList.add("open");
+    $("pauseLabel").textContent = "Resume";
+  } else {
+    // roll the clock's origin forward so the paused stretch doesn't count
+    if (window._pauseAt) S.startedAt += Date.now() - window._pauseAt;
+    window._pauseAt = null;
+    saveState();
+    $("pauseOverlay").classList.remove("open");
+    $("pauseLabel").textContent = "Pause";
+    startTimer();
+  }
 }
 
 /* ------------------------------------------------------------------ */
 /* chrome wiring                                                       */
 /* ------------------------------------------------------------------ */
+function closeDropdown() { $("setMenu").classList.remove("open"); }
+
+function toggleFloat(id, btnId) {
+  const p = $(id);
+  const open = p.classList.toggle("open");
+  if (btnId) $(btnId).classList.toggle("on", open);
+  return open;
+}
+
+function wireFloatDrag() {
+  document.querySelectorAll(".fphead[data-drag]").forEach((head) => {
+    const panel = $(head.dataset.drag);
+    head.addEventListener("mousedown", (e) => {
+      if (e.target.dataset && e.target.dataset.fpclose !== undefined) return;
+      const r = panel.getBoundingClientRect();
+      const dx = e.clientX - r.left, dy = e.clientY - r.top;
+      const move = (ev) => {
+        panel.style.left = Math.max(0, Math.min(window.innerWidth - 60, ev.clientX - dx)) + "px";
+        panel.style.top = Math.max(0, Math.min(window.innerHeight - 40, ev.clientY - dy)) + "px";
+        panel.style.right = "auto";
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      e.preventDefault();
+    });
+  });
+  document.querySelectorAll("[data-fpclose]").forEach((x) =>
+    x.addEventListener("click", () => {
+      $(x.dataset.fpclose).classList.remove("open");
+      if (x.dataset.fpclose === "calcPanel") $("calcBtn").classList.remove("on");
+      if (x.dataset.fpclose === "notesPanel") $("notesBtn").classList.remove("on");
+    }));
+}
+
 function wireChrome() {
   $("markChk").onchange = (e) => {
     const it = item(cur);
     if (e.target.checked) S.marks[it.item] = true; else delete S.marks[it.item];
-    $("markLbl").classList.toggle("on", e.target.checked);
+    updateSidebar();
     saveState();
   };
+
+  /* ---- settings dropdown ---- */
+  $("setBtn").onclick = (e) => {
+    e.stopPropagation();
+    $("setMenu").classList.toggle("open");
+    $("setBtn").classList.toggle("on", $("setMenu").classList.contains("open"));
+  };
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest || !e.target.closest(".tb-right")) {
+      closeDropdown(); $("setBtn").classList.remove("on");
+    }
+  });
   $("hlBtn").onclick = () => {
     hlOn = !hlOn;
-    $("hlBtn").style.background = hlOn ? "#ffffff33" : "transparent";
-    $("hlLabel").textContent = hlOn ? "Highlight: on" : "Highlight: off";
+    $("hlLabel").textContent = hlOn ? "on" : "off";
     const tl = overlay().querySelector(".textlayer");
     if (tl) tl.classList.toggle("hl-mode", hlOn);
     $("qhtml").classList.toggle("hl-mode", hlOn);
   };
-  $("hlBtn").style.background = "#ffffff33";
-  $("hlLabel").textContent = "Highlight: on";
-  $("clearHlBtn").onclick = clearHighlights;
-  $("labBtn").onclick = () => openModal("labModal");
-  $("calcBtn").onclick = () => openModal("calcModal");
-  $("navBtn").onclick = () => { buildNav(); openModal("navModal"); };
+  $("hlLabel").textContent = "on";
+  $("clearHlBtn").onclick = () => { clearHighlights(); closeDropdown(); };
+  $("timerBtn").onclick = () => {
+    timerShown = !timerShown;
+    $("timerLabel").textContent = timerShown ? "shown" : "hidden";
+    $("timer").classList.toggle("hidden-timer", !timerShown);
+  };
+
+  /* ---- tools ---- */
+  $("labBtn").onclick = () => {
+    const open = $("labPanel").classList.toggle("open");
+    $("labBtn").classList.toggle("on", open);
+    if (open) renderLab();
+  };
+  $("labClose").onclick = () => {
+    $("labPanel").classList.remove("open");
+    $("labBtn").classList.remove("on");
+  };
+  $("calcBtn").onclick = () => toggleFloat("calcPanel", "calcBtn");
+  $("notesBtn").onclick = () => toggleFloat("notesPanel", "notesBtn");
+  $("notesText").addEventListener("input", () => {
+    S.notes = $("notesText").value;
+    saveState();
+  });
+  wireFloatDrag();
+
+  /* ---- bottom bar ---- */
+  $("pauseBtn").onclick = () => setPaused(!paused);
+  $("pauseOverlay").onclick = () => setPaused(false);
   $("endBtn").onclick = () => { buildEndText(); openModal("endModal"); };
   $("confirmEnd").onclick = () => { closeModal(); submitExam(); };
+
+  /* ---- review bar ---- */
   $("exitReview").onclick = () => exitReview();
   wireExport();
   $("newExam").onclick = () => { location.reload(); };
@@ -605,11 +774,21 @@ function wireChrome() {
   const qh = $("qhtml");
   qh.addEventListener("click", (e) => {
     if (reviewing) return;
+    const ab = e.target.closest && e.target.closest(".cstrike");
+    if (ab) {
+      e.preventDefault(); e.stopPropagation();
+      toggleStrike(ab.parentElement.dataset.letter);
+      return;
+    }
     const w = e.target.closest && e.target.closest("span.w.hlw");
     if (w) { removeHlRun(item(cur), +w.dataset.wi, qh); return; }
     if (hlSuppress) return;
     const opt = e.target.closest && e.target.closest(".copt");
     if (opt) selectChoice(opt.dataset.letter);
+  });
+  qh.addEventListener("mousedown", (e) => {
+    // don't start a text selection when the strike glyph is pressed
+    if (e.target.closest && e.target.closest(".cstrike")) e.preventDefault();
   });
   qh.addEventListener("contextmenu", (e) => {
     if (reviewing) return;
@@ -627,21 +806,27 @@ function wireChrome() {
   document.querySelectorAll("[data-close]").forEach((x) =>
     x.addEventListener("click", closeModal));
 
-  // keyboard: arrows navigate, A-J select, 1-9 select, Esc closes
+  // keyboard: arrows navigate, A-J select, 1-9 select, M marks, Esc closes
   window.addEventListener("keydown", (e) => {
     if (document.querySelector(".modal-back.open")) {
       if (e.key === "Escape") closeModal();
       return;
     }
+    if (e.key === "Escape") { closeDropdown(); return; }
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (paused) return;
     if (e.key === "ArrowRight") reviewing ? showReview(cur + 1) : showItem(cur + 1);
     else if (e.key === "ArrowLeft") reviewing ? showReview(cur - 1) : showItem(cur - 1);
     else if (!reviewing) {
       const it = item(cur);
       const L = e.key.toUpperCase();
-      if (/^[A-J]$/.test(L) && it.choices.some((c) => c.letter === L)) selectChoice(L);
+      const letters = it.content ? it.content.choices.map((c) => c.letter)
+                                 : it.choices.map((c) => c.letter);
+      if (/^[A-J]$/.test(L) && letters.includes(L)) selectChoice(L);
       else if (/^[1-9]$/.test(e.key)) {
-        const c = it.choices[parseInt(e.key, 10) - 1];
-        if (c) selectChoice(c.letter);
+        const c = letters[parseInt(e.key, 10) - 1];
+        if (c) selectChoice(c);
       } else if (L === "M") { $("markChk").click(); }
     }
   });
@@ -651,7 +836,7 @@ function wireChrome() {
   window.addEventListener("resize", () => {
     clearTimeout(rt);
     rt = setTimeout(() => {
-      if (item(cur).content) return;
+      if (!DATA || item(cur).content) return;
       if (reviewing) layoutReview(item(cur));
       else layoutItem(item(cur));
     }, 120);
@@ -684,37 +869,46 @@ function buildLab() {
   $("siToggle").addEventListener("change", renderLab);
   renderLab();
 }
+function labValueHtml(v) {
+  if (!v) return "";
+  return escHtml(v).split(" // ").map((s) => `<div>${s}</div>`).join("");
+}
+function labRowHtml(r, si, extra) {
+  if (r.length === 1) {   // italic section heading
+    return `<tr class="sect"><td colspan="2">${escHtml(r[0])}</td></tr>`;
+  }
+  const ind = /^\s/.test(r[0]);
+  const name = escHtml(r[0].trim()) + (extra || "");
+  const val = si ? (r[2] || r[1]) : r[1];
+  return `<tr><td class="${ind ? "ind" : ""}">${name}</td>` +
+    `<td class="val">${labValueHtml(val)}</td></tr>`;
+}
 function renderLab() {
   document.querySelectorAll(".labtab").forEach((t) =>
     t.classList.toggle("on", t.textContent === labCat));
   const si = $("siToggle").checked;
   const q = $("labSearch").value.trim().toLowerCase();
-  const rows = window.LAB_VALUES[labCat] || [];
-  let html = '<table class="lab"><thead><tr><th>Test</th><th>Reference range</th></tr></thead><tbody>';
-  rows.forEach((r) => {
-    const val = si ? (r[2] || r[1]) : r[1];
-    const hidden = q && !(r[0].toLowerCase().includes(q));
-    html += `<tr class="${hidden ? "hide" : ""}"><td>${r[0]}</td><td class="val">${val || "—"}</td></tr>`;
-  });
-  html += "</tbody></table>";
+
   if (q) {
-    let any = false;
-    let all = '<table class="lab"><thead><tr><th>Test</th><th>Reference range</th></tr></thead><tbody>';
+    let rows = "";
     Object.entries(window.LAB_VALUES).forEach(([cat, rs]) => {
       rs.forEach((r) => {
-        if (r[0].toLowerCase().includes(q)) {
-          any = true;
-          const val = si ? (r[2] || r[1]) : r[1];
-          all += `<tr><td>${r[0]} <span style="color:#8794a3;font-size:11px">(${cat})</span></td><td class="val">${val || "—"}</td></tr>`;
+        if (r.length > 1 && r[0].toLowerCase().includes(q)) {
+          rows += labRowHtml(r, si, ` <span class="lab-cat">(${escHtml(cat)})</span>`);
         }
       });
     });
-    all += "</tbody></table>";
-    $("labBody").innerHTML = any ? all :
-      '<div style="padding:30px;text-align:center;color:#889">No matching test.</div>';
+    $("labBody").innerHTML = rows
+      ? `<table class="lab"><thead><tr><th>SEARCH</th>` +
+        `<th class="val">Reference Range</th></tr></thead><tbody>${rows}</tbody></table>`
+      : '<div class="lab-empty">No matching test.</div>';
     return;
   }
-  $("labBody").innerHTML = html;
+
+  const rows = (window.LAB_VALUES[labCat] || []).map((r) => labRowHtml(r, si)).join("");
+  $("labBody").innerHTML =
+    `<table class="lab"><thead><tr><th>${escHtml(labCat.toUpperCase())}</th>` +
+    `<th class="val">Reference Range</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 /* ---- calculator ---- */
@@ -747,26 +941,6 @@ function buildCalc() {
   refresh();
 }
 
-/* ---- navigator ---- */
-function buildNav() {
-  const g = $("navGrid");
-  g.innerHTML = "";
-  DATA.items.forEach((it, i) => {
-    const c = document.createElement("div");
-    c.className = "navcell";
-    c.textContent = it.item;
-    if (S.answers[it.item]) c.classList.add("answered");
-    if (S.marks[it.item]) c.classList.add("marked");
-    if (!it.answer_available) c.classList.add("unavail");
-    if (i === cur) c.classList.add("current");
-    c.onclick = () => {
-      closeModal();
-      if (reviewing) showReview(i); else showItem(i);
-    };
-    g.appendChild(c);
-  });
-}
-
 /* ---- end block ---- */
 function buildEndText() {
   const answered = DATA.items.filter((it) => S.answers[it.item]).length;
@@ -783,7 +957,8 @@ function buildEndText() {
 /* submit + review                                                     */
 /* ------------------------------------------------------------------ */
 function submitExam() {
-  if (timerInt) clearInterval(timerInt);
+  if (timerInt) { clearInterval(timerInt); timerInt = null; }
+  setPaused(false);
   let correct = 0, scored = 0;
   DATA.items.forEach((it) => {
     if (!it.answer_available) return;
@@ -793,7 +968,6 @@ function submitExam() {
   const pct = scored ? Math.round((correct / scored) * 100) : 0;
   DATA._score = { correct, scored, pct };
   reviewing = true;
-  $("topbar").style.display = "none";
   $("content").style.display = "none";
   $("reviewbar").style.display = "flex";
   $("reviewwrap").style.display = "block";
@@ -804,7 +978,7 @@ function submitExam() {
     (naCount ? ` &nbsp;·&nbsp; ${naCount} item(s) had no answer key and were not scored` : "");
   $("hlBtn").style.display = "none";
   $("clearHlBtn").style.display = "none";
-  $("markChk").parentElement.style.display = "none";
+  $("pauseBtn").style.display = "none";
   $("endBtn").style.display = "none";
   showReview(0);
 }
@@ -812,8 +986,11 @@ function submitExam() {
 async function showReview(i) {
   cur = Math.max(0, Math.min(DATA.count - 1, i));
   const it = item(cur);
+  $("curno").textContent = it.item;
+  $("counterNow").textContent = it.item;
   $("prevBtn").disabled = cur === 0;
   $("nextBtn").disabled = cur === DATA.count - 1;
+  updateSidebar();
   const strip = $("resultstrip");
   const img = $("reviewimg");
   const na = $("naNote");
@@ -947,11 +1124,20 @@ function markSvg(kind, size) {
 }
 
 function escHtml(s) {
-  return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 }
 function renderExplanation(info) {
   return info.paragraphs.map((p) => {
     let html = escHtml(p);
+    // the key's lead line is sometimes its own paragraph ("Correct Answer: A.")
+    // and sometimes runs straight on into the discussion; only the lead line
+    // itself should get the green heading treatment.
+    const lead = /^(Correct Answer\s*:\s*[A-J]\s*\.?)([\s\S]*)$/.exec(p);
+    if (lead) {
+      const rest = lead[2].trim();
+      return `<p class="ans-correct">${escHtml(lead[1])}</p>` +
+             (rest ? `<p>${escHtml(rest)}</p>` : "");
+    }
     if (/^Correct Answer\s*:/.test(p)) return `<p class="ans-correct">${html}</p>`;
     html = html.replace(/^(Incorrect Answers:|Educational Objective:)/, "<b>$1</b>");
     return `<p>${html}</p>`;
@@ -960,14 +1146,13 @@ function renderExplanation(info) {
 
 function exitReview() {
   reviewing = false;
-  if (timerInt) clearInterval(timerInt);
+  if (timerInt) { clearInterval(timerInt); timerInt = null; }
   $("reviewbar").style.display = "none";
   $("reviewwrap").style.display = "none";
-  $("topbar").style.display = "flex";
   $("content").style.display = "block";
   $("hlBtn").style.display = "";
   $("clearHlBtn").style.display = "";
-  $("markChk").parentElement.style.display = "";
+  $("pauseBtn").style.display = "";
   $("endBtn").style.display = "";
   startTimer();
   showItem(cur);
@@ -1047,6 +1232,12 @@ async function buildExport(includeExpl, onProgress) {
       if (r.explanation) { md.push(""); md.push("**Answer key:** " + r.explanation.join("\n\n")); }
     });
   }
+  if (S.notes && S.notes.trim()) {
+    md.push("");
+    md.push("## Notes");
+    md.push(S.notes.trim());
+    json.notes = S.notes;
+  }
   return { json, md: md.join("\n") + "\n" };
 }
 function downloadText(name, text, mime) {
@@ -1095,7 +1286,9 @@ function wireExport() {
 
 /* ------------------------------------------------------------------ */
 document.addEventListener("DOMContentLoaded", () => {
-  wireDrop("drop-q", "txt-q", "file-q");
-  wireDrop("drop-a", "txt-a", "file-a");
-  $("go").addEventListener("click", startExam);
+  if ($("drop-q")) {
+    wireDrop("drop-q", "txt-q", "file-q");
+    wireDrop("drop-a", "txt-a", "file-a");
+    $("go").addEventListener("click", startExam);
+  }
 });

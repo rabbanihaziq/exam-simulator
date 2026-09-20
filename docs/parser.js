@@ -3,10 +3,17 @@
    using PDF.js. Everything runs in the browser: the PDFs never leave the
    user's machine.
 
-   parseExam(questionBytes, answerBytes, onProgress) resolves to the same
+   parseExam(questionBytes, answerBytes, onProgress, opts) resolves to the same
    data shape the Flask /api/exam endpoint served, plus:
      - qURLs[i]      : blob URL of the cropped question-page image
      - answerURL(i)  : lazy blob URL of the full answer-key page image
+
+   A PDF that is one screenshot per page with no text layer is recognized here
+   with tesseract.js, fetched from a CDN only when such a document is detected
+   (see "OCR for image-only PDFs" below).
+
+   opts (all optional, used by tests/harness):
+     - keepPageImages : keep the page render even for items that parsed as text
 */
 
 const SCALE = 132 / 72;   // same 132 dpi rendering as the server version
@@ -308,24 +315,26 @@ function inkFigures(imgData, top, stemBot, textRects) {
 /* Let a figure run past the first answer choice.
 
    inkFigures only scans the stem band, because below it the answer choices'
-   radio circles and text are ink too. But some items are laid out in two
-   columns, with the exhibit in a column beside the stem that continues well
-   past choice A — scanning only the stem band slices such an image in half.
-   A figure whose column is clear of the choice text can safely be followed
-   down to the bottom of the content. */
+   radio circles and text are ink too. But an exhibit can carry on past
+   choice A — a two-column item whose figure sits beside the stem, or simply a
+   tall image — and scanning only the stem band slices it in half.
+
+   Choice text is masked like any other text; the radio circles are drawn, not
+   written, so they carry no text box and have to be masked explicitly. Once
+   they are, ANY figure can be followed downwards: a column that really does
+   share its rows with the choices finds only masked pixels and stops on its
+   own. (Before, only a figure starting right of the choice letters was
+   followed, so a full-width exhibit, or one in the choice column, was always
+   cut off at choice A.) */
 function extendFiguresBelow(imgData, figs, stemBot, contentBot, textRects, pxChoices) {
   const data = imgData.data, W = imgData.width;
-  // Only the radio circles are ink the text mask can't hide, and they sit just
-  // left of the choice letters, so a figure starting right of the letters can
-  // be followed down safely. Choice text itself is masked, and a figure column
-  // that does overlap it simply finds no ink and stops.
-  const lettersEnd = pxChoices.reduce((m, c) => Math.max(m, c.lx1), 0);
+  const mask = textRects.concat(pxChoices.map((c) => [
+    c.cx - c.rad - 6, c.cy - c.rad - 6, c.cx + c.rad + 6, c.cy + c.rad + 6]));
   for (const f of figs) {
-    if (f.x0 < lettersEnd + 8) continue;   // shares the column with the choices
     let lastInk = f.y1, gap = 0;
     for (let y = Math.ceil(stemBot); y < Math.floor(contentBot); y += 2) {
       const iv = [];
-      for (const r of textRects) if (y >= r[1] && y <= r[3]) iv.push([r[0], r[2]]);
+      for (const r of mask) if (y >= r[1] && y <= r[3]) iv.push([r[0], r[2]]);
       iv.sort((a, b) => a[0] - b[0]);
       let cnt = 0, k = 0;
       const from = Math.max(0, Math.floor(f.x0)), to = Math.min(W, Math.ceil(f.x1));
@@ -360,19 +369,117 @@ function wordRun(w, wid) {
   return r;
 }
 
+/* Lab-value tables and other column blocks read fine as text but reflow into
+   nonsense, so they are cropped as pictures instead. They are found line by
+   line, not paragraph by paragraph: a stem and the vitals table under it are
+   one paragraph as far as line spacing goes, and classifying the paragraph
+   used to turn the whole stem into an image — no selectable text, nothing in
+   the results export.
+
+   A line is columnar when it has an internal gap far wider than the page's own
+   word spacing, or when it starts well right of the text margin and is short.
+   The second test matters because a table whose label column the PDF draws
+   rather than writes (Surgery 6 item 44 prints "pH", "Pco2"… as vectors)
+   leaves a value column with no wide gap of its own. Two adjacent columnar
+   lines make a table; a lone one is an OCR hole in a prose line, so it is
+   ignored. A short line with no gap — a "Serum" sub-heading, a wrapped value —
+   joins a run it sits inside. */
+function findTableRuns(lines, cw) {
+  if (lines.length < 2) return [];
+  const gaps = [];
+  for (const L of lines) {
+    for (let i = 1; i < L.words.length; i++) gaps.push(L.words[i].x0 - L.words[i - 1].x1);
+  }
+  const gapThr = Math.max(median(gaps) * 5, cw * 0.02, 10);
+  const prose = lines.filter((L) => L.words.length >= 8);
+  const textLeft = Math.min(...(prose.length ? prose : lines).map((L) => L.x0));
+  const indent = textLeft + cw * 0.075;
+  const pitches = [];
+  for (let i = 1; i < lines.length; i++) {
+    const d = lines[i].base - lines[i - 1].base;
+    if (d > 2) pitches.push(d);
+  }
+  const pitch = median(pitches) || 26;
+
+  const runs = [];
+  let cur = null;
+  lines.forEach((L, i) => {
+    let g = 0;
+    for (let k = 1; k < L.words.length; k++) g = Math.max(g, L.words[k].x0 - L.words[k - 1].x1);
+    const columnar = g > gapThr || (L.x0 > indent && L.words.length <= 8);
+    if (!columnar) { cur = null; return; }
+    if (cur && L.base - lines[i - 1].base < pitch * 2.2) cur.push(L);
+    else { cur = [L]; runs.push(cur); }
+  });
+  return runs.filter((r) => r.length >= 2);
+}
+
 /* Build the structured content for one question page: stem paragraphs with
    inline figure crops, plus per-choice text runs. Returns null when the page
    doesn't extract cleanly (caller falls back to image mode). */
 async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
   if (!pxChoices.length) return null;
   const stemBot = pxChoices[0].rowTop;
-  const stemWords = raw.filter((w) => w.y0 >= top - 2 && w.y1 <= stemBot + 2);
+  // The stem ends at choice A's BASELINE, not at the top of its box. A word's
+  // box is y0 = baseline - fontSize, y1 = baseline + 0.25*fontSize, so a last
+  // stem line only a line and a half above choice A failed `y1 <= rowTop` and
+  // vanished from the text render entirely. The choice rows below are already
+  // bounded by baselines for the same reason.
+  const stemLimit = pxChoices[0].base - pxChoices[0].tol;
+  const stemWords = raw.filter((w) => w.y0 >= top - 2 && w.base < stemLimit);
   if (stemWords.length < 5) return null;
 
-  // ---- figures first (column-aware): ink regions outside every text box --
+  // ---- figures: ink regions outside every text box, then column blocks -----
+  // lines first: merging two figures must never produce a rectangle that
+  // swallows body text sitting between them (see mergeBlocked below)
+  let lines = clusterTextLines(stemWords);
+  const pitches = [];
+  for (let i = 1; i < lines.length; i++) {
+    const d = lines[i].base - lines[i - 1].base;
+    if (d > 2) pitches.push(d);
+  }
+  const pitch = median(pitches) || 26;
   const textRects = (raw.itemRects || [])
     .map((r) => [r[0] - 4, r[1] - 4, r[2] + 4, r[3] + 4]);
+  // Note: line-sized ink slivers are kept. They are usually a line of text the
+  // source's OCR layer missed entirely (Surgery 8 item 50's "of action?"), and
+  // cropping them is the only way those words reach the reader at all.
   let figs = inkFigures(imgData, top, stemBot, textRects);
+
+  function figsTouch(a, b) {
+    const ovX = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+    const ovY = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+    // two halves of one region, near-touching in both axes
+    if (ovY > -8 && ovX > -40) return true;
+    // one column with a small vertical break: a two-panel image, or a table
+    // with a blank row, which inkFigures splits at any gap over 12px
+    if (ovX > Math.min(a.x1 - a.x0, b.x1 - b.x0) * 0.5 && ovY > -36) return true;
+    // A table's label column can be drawn rather than written (Surgery 6
+    // item 44 prints "pH", "Pco2"… as vectors), leaving it a separate ink
+    // region a column's width away from the values it labels. Join the two,
+    // but only when the shorter region sits entirely within the other's rows:
+    // an exhibit that merely shares a band with the table would otherwise drag
+    // the union rectangle across the stem between them.
+    if ((a.tbl || b.tbl) && ovY >= Math.min(a.y1 - a.y0, b.y1 - b.y0) - 8 &&
+        ovX > -cw * 0.15) return true;
+    return false;
+  }
+  /* Two figures in neighbouring columns can be a few pixels apart and still
+     share rows, and their union is then a rectangle covering the stem text
+     above or beside them. Refuse such a merge: if a body line lands well
+     inside the union but touches neither box, the two are separate figures. */
+  function mergeBlocked(a, b) {
+    const ux0 = Math.min(a.x0, b.x0), uy0 = Math.min(a.y0, b.y0);
+    const ux1 = Math.max(a.x1, b.x1), uy1 = Math.max(a.y1, b.y1);
+    const over = (f, L) => Math.max(0, Math.min(f.x1, L.x1) - Math.max(f.x0, L.x0)) *
+                           Math.max(0, Math.min(f.y1, L.y1) - Math.max(f.y0, L.y0));
+    return lines.some((L) => {
+      if (L.inFig) return false;
+      const area = Math.max(1, (L.x1 - L.x0) * (L.y1 - L.y0));
+      return over({ x0: ux0, y0: uy0, x1: ux1, y1: uy1 }, L) / area > 0.3 &&
+             !over(a, L) && !over(b, L);
+    });
+  }
   function mergeFigs() {
     let merged = true;
     while (merged) {
@@ -380,11 +487,11 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
       outer:
       for (let i = 0; i < figs.length; i++) {
         for (let j = i + 1; j < figs.length; j++) {
-          if (figs[i].y0 <= figs[j].y1 + 8 && figs[j].y0 <= figs[i].y1 + 8 &&
-              figs[i].x0 <= figs[j].x1 + 40 && figs[j].x0 <= figs[i].x1 + 40) {
+          if (figsTouch(figs[i], figs[j]) && !mergeBlocked(figs[i], figs[j])) {
             figs[i] = {
               y0: Math.min(figs[i].y0, figs[j].y0), y1: Math.max(figs[i].y1, figs[j].y1),
               x0: Math.min(figs[i].x0, figs[j].x0), x1: Math.max(figs[i].x1, figs[j].x1),
+              tbl: figs[i].tbl || figs[j].tbl,
             };
             figs.splice(j, 1);
             merged = true;
@@ -395,35 +502,98 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     }
   }
   mergeFigs();
-  // words that live inside/near a figure region are part of it (chart titles,
-  // axis labels, values inside a diagram) — absorb them so side-by-side
-  // column layouts don't corrupt the body-text lines
-  const bodyWords = [];
-  for (const w of stemWords) {
+
+  // Words sitting inside an ink region are part of the picture: an "R"/"L"
+  // orientation marker on an x-ray, a value printed inside a chart. Drop them
+  // before the lines are formed — a marker that happens to share a baseline
+  // with body text otherwise stretches that line across the page, and the hole
+  // it leaves looks exactly like a table column.
+  //
+  // Only islands are dropped: a word is part of the picture when its whole
+  // line is inside the figure, or when it sits far from the nearest word on
+  // its line that isn't. A stem line whose last word merely reaches the edge
+  // of the exhibit beside it (OCR word boxes are a few pixels off, so the
+  // figure's detected edge can overlap it) stays text.
+  const inFigWord = (w) => {
     const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
-    const f = figs.find((f) => cx > f.x0 - 24 && cx < f.x1 + 24 &&
-                               cy > f.y0 - 110 && cy < f.y1 + 70);
-    if (f) {
-      f.x0 = Math.min(f.x0, w.x0 - 4); f.x1 = Math.max(f.x1, w.x1 + 4);
-      f.y0 = Math.min(f.y0, w.y0 - 4); f.y1 = Math.max(f.y1, w.y1 + 4);
-    } else bodyWords.push(w);
+    return figs.some((f) => cx > f.x0 - 4 && cx < f.x1 + 4 &&
+                            cy > f.y0 - 4 && cy < f.y1 + 4);
+  };
+  if (figs.length) {
+    const allGaps = [];
+    for (const L of lines) {
+      for (let i = 1; i < L.words.length; i++) allGaps.push(L.words[i].x0 - L.words[i - 1].x1);
+    }
+    const islandGap = Math.max(median(allGaps), 2) * 6;
+    const drop = new Set();
+    for (const L of lines) {
+      const ins = L.words.map(inFigWord);
+      L.words.forEach((w, i) => {
+        if (!ins[i]) return;
+        let d = Infinity;
+        L.words.forEach((o, j) => {
+          if (ins[j]) return;
+          d = Math.min(d, o.x0 >= w.x1 ? o.x0 - w.x1 : w.x0 - o.x1);
+        });
+        if (d > islandGap) drop.add(w);
+      });
+    }
+    if (drop.size) {
+      lines = clusterTextLines(stemWords.filter((w) => !drop.has(w)));
+      if (!lines.length) return null;
+    }
+  }
+
+  for (const run of findTableRuns(lines, cw)) {
+    run.forEach((L) => { L.inFig = true; });
+    figs.push({ tbl: 1,
+      x0: Math.min(...run.map((L) => L.x0)) - 4, x1: Math.max(...run.map((L) => L.x1)) + 4,
+      y0: Math.min(...run.map((L) => L.y0)) - 4, y1: Math.max(...run.map((L) => L.y1)) + 4 });
   }
   mergeFigs();
-  if (bodyWords.length < 5) return null;
+
+  // Text that belongs to a figure — a label inside a diagram, an axis label or
+  // a caption right above or below it — is absorbed into it. Whole lines only,
+  // and only lines that fit inside the figure's own column: the old rule
+  // matched word by word with 110px of vertical slack, so it took the middle
+  // out of stem lines that happened to run under an image. The holes it left
+  // then looked like table columns, and the whole stem became a picture.
+  for (let pass = 0; pass < 3; pass++) {
+    let grew = false;
+    for (const L of lines) {
+      if (L.inFig) continue;
+      for (const f of figs) {
+        if (!(L.x0 >= f.x0 - 24 && L.x1 <= f.x1 + 24)) continue;
+        const inside = L.y0 >= f.y0 - 4 && L.y1 <= f.y1 + 4;
+        // a caption is short; a stem line that merely passes above or below a
+        // full-width exhibit is not
+        const caption = L.words.length <= 8 &&
+          L.y0 > f.y0 - pitch * 1.2 && L.y1 < f.y1 + pitch * 1.2;
+        if (!inside && !caption) continue;
+        L.inFig = true;
+        grew = true;
+        f.x0 = Math.min(f.x0, L.x0 - 4); f.x1 = Math.max(f.x1, L.x1 + 4);
+        f.y0 = Math.min(f.y0, L.y0 - 4); f.y1 = Math.max(f.y1, L.y1 + 4);
+        break;
+      }
+    }
+    mergeFigs();
+    if (!grew) break;
+  }
+
+  const bodyLines = lines.filter((L) => !L.inFig);
+  if (bodyLines.reduce((n, L) => n + L.words.length, 0) < 5) return null;
 
   // ---- body text: lines -> paragraphs ------------------------------------
-  const lines = clusterTextLines(bodyWords);
-  const deltas = [];
-  for (let i = 1; i < lines.length; i++) {
-    const d = lines[i].base - lines[i - 1].base;
-    if (d > 2) deltas.push(d);
-  }
-  const med = median(deltas) || 26;
+  // Paragraph breaks are measured against the page's line pitch, taken over
+  // every line, not just the body ones: an item whose body is two lines of
+  // prose plus a question line under a table has a body-only median equal to
+  // the paragraph gap itself, and then nothing ever splits.
   const paras = [];
   let curP = null;
-  lines.forEach((L, i) => {
-    const gap = i ? L.base - lines[i - 1].base : 0;
-    if (!curP || gap > med * 1.55) { curP = { lines: [] }; paras.push(curP); }
+  bodyLines.forEach((L, i) => {
+    const gap = i ? L.base - bodyLines[i - 1].base : 0;
+    if (!curP || gap > pitch * 1.55) { curP = { lines: [] }; paras.push(curP); }
     curP.lines.push(L);
   });
   paras.forEach((p) => {
@@ -431,30 +601,25 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     p.y1 = Math.max(...p.lines.map((l) => l.y1));
     p.x0 = Math.min(...p.lines.map((l) => l.x0));
     p.x1 = Math.max(...p.lines.map((l) => l.x1));
-    // tabular text (aligned columns) renders badly reflowed -> treat as figure
-    let gappy = 0;
-    p.lines.forEach((l) => {
-      for (let i = 1; i < l.words.length; i++) {
-        if (l.words[i].x0 - l.words[i - 1].x1 > cw * 0.055) { gappy++; break; }
-      }
-    });
-    p.tabular = gappy >= 2;
+    p.nWords = p.lines.reduce((n, l) => n + l.words.length, 0);
   });
-  figs = figs.concat(paras.filter((p) => p.tabular)
-    .map((p) => ({ y0: p.y0 - 4, y1: p.y1 + 4, x0: p.x0 - 4, x1: p.x1 + 4 })));
-  mergeFigs();
-  // a text paragraph belongs to a figure when it overlaps it HORIZONTALLY —
-  // inside a bordered table, or a caption above/below the figure. A body
-  // paragraph merely sitting beside a figure stays real text.
+  // A paragraph belongs to a figure when it sits inside it (text within a
+  // bordered table) or is a short caption directly above or below it.
+  // A body paragraph that merely overlaps a figure's column stays real text:
+  // absorbing it turns the stem into pixels, which are neither selectable nor
+  // exported, and that is what the old `xFrac > 0.6 && ovY > -60` rule did to
+  // the last paragraph above every full-width exhibit.
   for (let pass = 0; pass < 2; pass++) {
     paras.forEach((p) => {
       if (p.consumed) return;
+      const short = p.lines.length <= 2 && p.nWords <= 12;
       for (const f of figs) {
         const ovY = Math.min(f.y1, p.y1) - Math.max(f.y0, p.y0);
         const ovX = Math.min(f.x1, p.x1) - Math.max(f.x0, p.x0);
         const xFrac = ovX / Math.max(1, p.x1 - p.x0);
-        if ((ovY > (p.y1 - p.y0) * 0.5 && xFrac > 0.3) ||
-            (xFrac > 0.6 && ovY > -60)) {
+        const within = p.x0 >= f.x0 - 24 && p.x1 <= f.x1 + 24;
+        if ((ovY > (p.y1 - p.y0) * 0.5 && xFrac > 0.3 && (within || short)) ||
+            (short && xFrac > 0.6 && ovY > -pitch * 1.2)) {
           p.consumed = true;
           f.y0 = Math.min(f.y0, p.y0 - 4); f.y1 = Math.max(f.y1, p.y1 + 4);
           f.x0 = Math.min(f.x0, p.x0 - 4); f.x1 = Math.max(f.x1, p.x1 + 4);
@@ -464,30 +629,63 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     });
   }
 
-  // Last, once every figure's extent is settled: follow a figure that sits in
-  // its own column down past the answer choices. Done here so a taller figure
-  // can't feed back into the merging and paragraph-absorbing above, where it
-  // could chain across the page and swallow the stem.
+  // Last, once every figure's extent is settled: follow a figure that carries
+  // on past the answer choices. Done here so a taller figure can't feed back
+  // into the merging and paragraph-absorbing above, where it could chain
+  // across the page and swallow the stem.
   extendFiguresBelow(imgData, figs, stemBot, top + ch, textRects, pxChoices);
 
   // assemble blocks in reading order, assigning word ids for highlighting
   let wid = 0;
   const blocks = [];
-  for (const p of paras.filter((p) => !p.consumed && !p.tabular)) {
+  for (const p of paras.filter((p) => !p.consumed)) {
     const runs = [];
     p.lines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
     if (runs.length) blocks.push({ t: "p", y: p.y0, runs });
   }
+  // Crop with a 6px margin, clamped to the content area: at 2px a thin table
+  // border or an axis line lands right on the edge and gets shaved off.
+  // Two corrections first, both about the body text beside a figure. An OCR'd
+  // word box a few pixels narrower than its glyphs leaks ink outside the text
+  // mask, so a band can start at the tail of the stem line next to it — pull
+  // such an edge back past the line, but only while it shaves the outer fifth
+  // of the figure. Then hold the margin short of any body line that sits right
+  // against the crop, so widening it never drags text into the picture.
+  const M = 6;
   for (const f of figs) {
+    const fw = f.x1 - f.x0;
+    let x0 = f.x0, x1 = f.x1;
+    const sameRows = (L) => Math.min(f.y1, L.y1) - Math.max(f.y0, L.y0) > 0;
+    for (const L of bodyLines) {
+      if (!sameRows(L)) continue;
+      if (L.x0 < f.x0 && L.x1 > x0 && L.x1 < f.x0 + fw * 0.2) x0 = L.x1 + 2;
+      if (L.x1 > f.x1 && L.x0 < x1 && L.x0 > f.x1 - fw * 0.2) x1 = L.x0 - 2;
+    }
+    let mL = M, mR = M, mT = M, mB = M;
+    for (const L of bodyLines) {
+      if (sameRows(L)) {
+        if (L.x1 <= x0) mL = Math.min(mL, Math.max(0, x0 - L.x1 - 1));
+        if (L.x0 >= x1) mR = Math.min(mR, Math.max(0, L.x0 - x1 - 1));
+      }
+      if (Math.min(x1, L.x1) - Math.max(x0, L.x0) > 0) {
+        if (L.y1 <= f.y0) mT = Math.min(mT, Math.max(0, f.y0 - L.y1 - 1));
+        if (L.y0 >= f.y1) mB = Math.min(mB, Math.max(0, L.y0 - f.y1 - 1));
+      }
+    }
+    const bx0 = Math.max(0, x0 - mL), by0 = Math.max(top, f.y0 - mT);
+    const bx1 = Math.min(cw, x1 + mR), by1 = Math.min(top + ch, f.y1 + mB);
     const block = {
       t: "img", y: f.y0,
-      url: await cropBlob(canvas, f.x0 - 2, f.y0 - 2, f.x1 + 2, f.y1 + 2),
-      x0f: Math.max(0, (f.x0 - 2) / cw),
-      wf: Math.min(1, (f.x1 - f.x0 + 4) / cw),
+      url: await cropBlob(canvas, bx0, by0, bx1, by1),
+      x0f: Math.max(0, bx0 / cw),
+      wf: Math.min(1, (bx1 - bx0) / cw),
+      // the crop rect in page pixels; only the test harness reads it, but it
+      // costs nothing and makes a bad crop diagnosable from items.json alone
+      px: [Math.round(bx0), Math.round(by0), Math.round(bx1), Math.round(by1)],
     };
     // a right-side figure with body text beside it floats right so the text
     // wraps around it like the original layout
-    const beside = paras.find((p) => !p.consumed && !p.tabular &&
+    const beside = paras.find((p) => !p.consumed &&
       Math.min(f.y1, p.y1) - Math.max(f.y0, p.y0) > (p.y1 - p.y0) * 0.3);
     if (beside && f.x0 > cw * 0.45) { block.fr = 1; block.y = beside.y0 - 1; }
     blocks.push(block);
@@ -741,19 +939,596 @@ function dedupeWords(words) {
   return kept;
 }
 
+/* ---------------- OCR for image-only PDFs ------------------------------- */
+
+/* Some share PDFs are one screenshot per page with no text layer at all: pdf.js
+   finds about 25 characters of t.me watermark and nothing else, so "Item N of
+   50", "A)" and "Correct Answer: X" are all invisible and no exam can be built.
+   Rather than send the user to a command-line tool, such a document is read
+   here with tesseract.js, which is fetched from a CDN only when one is actually
+   detected — a PDF that has a text layer never touches the network.
+
+   Everything downstream is unchanged: the OCR result is handed back in exactly
+   the shapes getPageWords/getPageLines produce, so stitching, item numbering,
+   the choice logic and the answer-key extraction all run as they always do. */
+
+const TESS_VERSION = "5.1.1";          // pinned: the version this was tested on
+const TESS_SRC = `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist/tesseract.min.js`;
+const OCR_DPI = 200;                   // the screenshots are ~2670px wide: about native
+const OCR_CACHE_VERSION = 1;           // bump to invalidate every cached page
+const OCR_DB = "exam-parser-ocr", OCR_STORE = "pages";
+
+/* Load tesseract.js on demand. Its worker, wasm core and language data all
+   default to the same jsdelivr CDN, so only this one script has to be named. */
+let tessPromise = null;
+function loadTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (!tessPromise) {
+    tessPromise = new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = TESS_SRC;
+      s.async = true;
+      s.onload = () => (window.Tesseract ? res(window.Tesseract)
+                                         : rej(new Error("no Tesseract global")));
+      s.onerror = () => rej(new Error("script load failed"));
+      document.head.appendChild(s);
+    }).catch(() => {
+      tessPromise = null;
+      throw new Error(
+        "This PDF has no text layer, so it has to be read with OCR — and the " +
+        "OCR engine could not be downloaded. Check your internet connection " +
+        "(the engine comes from cdn.jsdelivr.net) and try again, or add a text " +
+        "layer to the PDFs first with the OCR tool in the repo's tools/ocr_layer " +
+        "folder and load the files it produces.");
+    });
+  }
+  return tessPromise;
+}
+
+/* Image-only: under ~60 alphanumeric characters per page over the first three
+   pages. Decided per document, so a text questions PDF and a scanned answer
+   key can be mixed. */
+async function docIsImageOnly(doc) {
+  const n = Math.min(3, doc.numPages);
+  let chars = 0;
+  for (let i = 1; i <= n; i++) {
+    const page = await doc.getPage(i);
+    const tc = await page.getTextContent();
+    for (const it of tc.items) chars += (it.str.match(/[A-Za-z0-9]/g) || []).length;
+    page.cleanup();
+  }
+  return chars / n < 60;
+}
+
+async function sha256Hex(bytes) {
+  const h = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/* IndexedDB page cache. Every call degrades to "no cache" rather than failing:
+   private windows, blocked site data and quota errors are all normal. */
+function idbOpen() {
+  return new Promise((res) => {
+    try {
+      const rq = indexedDB.open(OCR_DB, 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore(OCR_STORE);
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => res(null);
+      rq.onblocked = () => res(null);
+    } catch (e) { res(null); }
+  });
+}
+function idbGet(db, key) {
+  return new Promise((res) => {
+    if (!db) return res(null);
+    try {
+      const rq = db.transaction(OCR_STORE, "readonly").objectStore(OCR_STORE).get(key);
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => res(null);
+    } catch (e) { res(null); }
+  });
+}
+function idbPut(db, key, val) {
+  return new Promise((res) => {
+    if (!db) return res();
+    try {
+      const tx = db.transaction(OCR_STORE, "readwrite");
+      tx.objectStore(OCR_STORE).put(val, key);
+      tx.oncomplete = () => res();
+      tx.onerror = () => res();
+      tx.onabort = () => res();
+    } catch (e) { res(); }
+  });
+}
+
+/* Render one page for OCR and flatten it to luminance. Tesseract silently
+   drops whole coloured regions — a yellow-highlighted choice row, the blue
+   "Correct Answer" line — and a grey page comes back with half again as many
+   words on those pages. */
+async function renderForOcr(doc, pno, scale) {
+  const page = await doc.getPage(pno);
+  const vp = page.getViewport({ scale });
+  const c = document.createElement("canvas");
+  c.width = Math.round(vp.width);
+  c.height = Math.round(vp.height);
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  await renderPage(page, vp, ctx);
+  page.cleanup();
+  const im = ctx.getImageData(0, 0, c.width, c.height);
+  const d = im.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+    d[i] = d[i + 1] = d[i + 2] = g;
+  }
+  ctx.putImageData(im, 0, 0);
+  return c;
+}
+
+/* ---- token cleanups (ported from the Vision pipeline's build_layer.py) ---- */
+
+const OCR_MARKERS = new Set(["X", "x", "×", "%", "*", "✓", "√", "'", '"']);
+// a junk token before a choice letter is the radio circle, read as one of these
+const OCR_JUNK = /^[Oo0QJCG©®•()\[\]{}.,_|\-—–\s]+$/;
+
+/* "(A)", "[A)", "OA)", "©A)", "BE)", "F.)" are all the radio circle fused to a
+   choice letter. Keep the last letter before the ")" and pull the box in from
+   the left, because the circle occupies the part being dropped. */
+function unfuseChoiceLabel(t) {
+  const m = t.text.match(/^(.{0,3}?)([A-J])\.?\)$/);
+  if (!m || /[a-z]/.test(m[1])) return t;
+  const dropped = t.text.length - 2;
+  if (!dropped) return t;
+  return { ...t, text: m[2] + ")",
+           x0: t.x0 + (t.x1 - t.x0) * (dropped / t.text.length) };
+}
+
+function cleanOcrTokens(toks, hdr, takeItemNo) {
+  // "B" + ")" -> "B)"
+  const merged = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (/^[A-J]$/.test(t.text) && i + 1 < toks.length && toks[i + 1].text === ")") {
+      merged.push({ ...t, text: t.text + ")", x1: toks[i + 1].x1 });
+      i++;
+    } else merged.push(t);
+  }
+  toks = merged.map((t, i) => (i <= 2 ? unfuseChoiceLabel(t) : t));
+
+  // Low-confidence junk goes, but only after the label has been unfused: a
+  // radio circle read as part of the letter ("OC)") drags the whole token's
+  // confidence under the threshold, and dropping it costs the item a choice.
+  toks = toks.filter((t) => t.c === undefined || t.c >= 25 || /^.{0,3}\)$/.test(t.text));
+
+  // a red X (or a check, or a stray quote) precedes a wrongly answered item's
+  // number on answer pages
+  if (toks.length >= 2 && OCR_MARKERS.has(toks[0].text) &&
+      /^\d{1,2}\.?$/.test(toks[1].text)) toks = toks.slice(1);
+
+  // the item number that opens the stem must read "31.", not "31"
+  if (takeItemNo && hdr && toks.length > 1 && toks[0].text === hdr) {
+    toks[0] = { ...toks[0], text: hdr + "." };
+  }
+
+  // Radio-circle leftovers immediately before a choice letter. The letter is
+  // not always readable — a circle touching a C comes back as "(OO" + "€)" —
+  // so a short low-confidence token ending in ")" counts as the label here and
+  // repairChoiceRun works out which letter it is afterwards.
+  let li = toks.findIndex((t) => /^[A-J]\)$/.test(t.text));
+  if (li < 0) {
+    li = toks.findIndex((t) => /^.{0,3}\)$/.test(t.text) &&
+                               (t.c === undefined || t.c < 60));
+  }
+  if (li > 0 && li <= 2 && toks.slice(0, li).every((t) => OCR_JUNK.test(t.text))) {
+    toks = toks.slice(li);
+  }
+
+  return toks.filter((t) => /[A-Za-z0-9]/.test(t.text) || /^.{0,3}\)$/.test(t.text));
+}
+
+/* The choice letter itself can be misread, or missed altogether: with the
+   radio circle touching it, "C)" comes back as "€)" and sometimes as nothing
+   at all. Because the parser only keeps a contiguous run from A, one bad
+   letter costs the item every choice from there down.
+
+   The labels sit one per row in a single column, with the choice text in a
+   second column, so the run can be rebuilt positionally. Take every line that
+   opens in either column, letter them in page order, and accept the result
+   only when every cleanly read label already agrees with the letter its
+   position implies AND the sequence starts at A — anything else (a wrapped
+   choice line, an explanation paragraph at the same indent) breaks the
+   agreement and the page is left alone. */
+function repairChoiceRun(recs) {
+  const head = (r) => r.toks[0];
+  const clean = (t) => /^[A-J]\)$/.test(t.text);
+  const good = recs.filter((r) => head(r) && clean(head(r)));
+  if (good.length < 2) return;
+  const colX = median(good.map((r) => head(r).x0));
+  const labW = median(good.map((r) => head(r).x1 - head(r).x0));
+  const withText = good.filter((r) => r.toks.length > 1);
+  if (!withText.length) return;
+  const textX = median(withText.map((r) => r.toks[1].x0));
+  if (textX - colX < labW * 0.8) return;     // can't tell the columns apart
+
+  const cand = recs.filter((r) => {
+    const t = head(r);
+    if (!t) return false;
+    // a label, however badly read, still looks like one and sits in the label
+    // column — which on some forms is also the stem's left margin, so the
+    // shape test matters. A circle fused into the letter ("OF") swallows the
+    // bracket and starts a circle's width further left.
+    if (Math.abs(t.x0 - colX) <= 12) return /^.{0,3}\)$/.test(t.text);
+    if (t.x0 > colX - labW * 2 && t.x0 < colX) {
+      return /^[Oo0Q\u00a9\u00ae\u2022(\[]{1,2}[A-J]$/.test(t.text);
+    }
+    // no label read at all: the line starts at the choice-text column
+    return Math.abs(t.x0 - textX) <= 12;
+  }).sort((a, b) => a.b - b.b);
+  if (cand.length < 2) return;
+
+  // Where does A sit? A prose line can look like a label ("(T,)" in the stem
+  // above the choices), so try each start and keep the one that letters every
+  // cleanly read label correctly.
+  let i0 = -1;
+  for (let i = 0; i < cand.length && i0 < 0; i++) {
+    let ok = true;
+    for (let j = 0; j < cand.length; j++) {
+      if (!clean(head(cand[j]))) continue;
+      if (j < i || head(cand[j]).text.charCodeAt(0) !== 65 + (j - i)) { ok = false; break; }
+    }
+    if (ok) i0 = i;
+  }
+  if (i0 < 0) return;
+
+  // and where does it stop? Rows of choices are evenly spaced; a bigger gap
+  // after the last real label means the next candidate is something else.
+  const gaps = [];
+  for (let j = i0 + 1; j < cand.length; j++) gaps.push(cand[j].b - cand[j - 1].b);
+  const rowGap = median(gaps) || 1;
+  const lastGood = cand.lastIndexOf(good[good.length - 1]);
+  let i1 = cand.length - 1;
+  for (let j = i0 + 1; j < cand.length; j++) {
+    if (j > lastGood && cand[j].b - cand[j - 1].b > rowGap * 1.7) { i1 = j - 1; break; }
+  }
+
+  let fixes = 0;
+  for (let j = i0; j <= i1; j++) if (!clean(head(cand[j]))) fixes++;
+  if (!fixes) return;
+  for (let j = i0; j <= i1; j++) {
+    const r = cand[j], t = head(r);
+    if (clean(t)) continue;
+    const want = String.fromCharCode(65 + (j - i0)) + ")";
+    if (t.x0 < textX - labW * 0.5) {
+      // a misread label: keep the row, fix the text, and put the box back in
+      // the label column (a fused circle drags x0 left of it)
+      t.text = want;
+      t.x1 = colX + labW;
+      t.x0 = colX;
+    } else {
+      // the label was not recognised at all: put one back where it belongs
+      r.toks.unshift({ text: want, x0: colX, x1: colX + labW, c: 99 });
+    }
+  }
+}
+
+/* Turn one tesseract.js result into the cached per-page record: one entry per
+   visual line, with a single baseline and font size, because that is what the
+   downstream line/row logic keys on. Coordinates are divided back to PDF
+   points so any render scale can use them. */
+function ocrPageRecord(data, scale, height, hdr) {
+  const raw = [];
+  for (const b of data.blocks || []) {
+    for (const p of b.paragraphs || []) {
+      for (const l of p.lines || []) {
+        const ws = (l.words || []).filter((w) => w.text && w.text.trim());
+        if (!ws.length) continue;
+        raw.push({ l, ws });
+      }
+    }
+  }
+  if (!raw.length) return { v: OCR_CACHE_VERSION, L: [] };
+
+  const heights = raw.map(({ l }) => l.bbox.y1 - l.bbox.y0);
+  const medH = median(heights) || 20;
+  // tesseract's font_size is not dependable; the cap height is
+  const sizes = raw.map(({ l }) => (baselineAt(l, (l.bbox.x0 + l.bbox.x1) / 2) - l.bbox.y0) / 0.73);
+  const medFs = median(sizes.filter((s) => s > 0)) || medH * 1.3;
+
+  const out = [];
+  let itemNoTaken = false;
+  raw.forEach(({ l, ws }, i) => {
+    const inContent = l.bbox.y0 > height * 0.06 && l.bbox.y1 < height * 0.94;
+    const lh = l.bbox.y1 - l.bbox.y0;
+    // a line the scroll screenshot cut in half is unreadable, not text
+    if (inContent && lh < medH * 0.65 && ws.length >= 3) return;
+    const meanConf = ws.reduce((s, w) => s + w.confidence, 0) / ws.length;
+    const nearEdge = l.bbox.y0 < height * 0.10 || l.bbox.y1 > height * 0.90;
+    if (inContent && nearEdge && meanConf < 50) return;
+
+    let toks = ws.map((w) => ({ text: w.text, x0: w.bbox.x0, x1: w.bbox.x1,
+                                c: w.confidence }));
+    const takeItemNo = inContent && !itemNoTaken;
+    toks = cleanOcrTokens(toks, hdr, takeItemNo);
+    if (!toks.length) return;
+    if (takeItemNo && hdr && toks[0].text === hdr + ".") itemNoTaken = true;
+
+    const base = baselineAt(l, (l.bbox.x0 + l.bbox.x1) / 2);
+    // Clamp hard to the page's own font size. The cap-height estimate swings
+    // by a third depending on whether a line happens to contain a tall
+    // ascender, and clusterTextLines folds a line into its neighbour as a
+    // subscript once it looks 20 percent shorter — which interleaved two stem
+    // lines word by word and scrambled the sentence. A tight band keeps every
+    // body line the same height, and the page's body text really is one size.
+    let fs = Math.max(1, sizes[i]);
+    fs = Math.max(medFs * 0.9, Math.min(medFs * 1.1, fs));
+    out.push({ b: base, f: fs, toks });
+  });
+  out.sort((a, b) => a.b - b.b);
+  repairChoiceRun(out);
+  applyDotChoiceLabels(out);
+  // now that the labels are settled, the tokens kept only because they might
+  // have been one can go if they are still unreadable
+  const L = [];
+  for (const r of out) {
+    const toks = r.toks.filter((t) => /^[A-J]\)$/.test(t.text) ||
+                                      ((t.c === undefined || t.c >= 25) &&
+                                       /[A-Za-z0-9]/.test(t.text)));
+    if (!toks.length) continue;
+    L.push({
+      b: +(r.b / scale).toFixed(2),
+      f: +(r.f / scale).toFixed(2),
+      w: toks.map((t) => [+(t.x0 / scale).toFixed(2), +(t.x1 / scale).toFixed(2), t.text]),
+    });
+  }
+  return { v: OCR_CACHE_VERSION, L };
+}
+
+function baselineAt(l, x) {
+  const b = l.baseline;
+  if (!b || !b.has_baseline) return l.bbox.y1;
+  const span = b.x1 - b.x0;
+  if (Math.abs(span) < 1) return b.y0;
+  return b.y0 + (b.y1 - b.y0) * ((x - b.x0) / span);
+}
+
+/* The real NBME interface labels choices "A." not "A)". Accept that spelling,
+   but only when no "A)" run exists and the dotted letters open their lines and
+   form a contiguous run from A — otherwise an abbreviation would become a
+   choice and shift the whole item. */
+function applyDotChoiceLabels(recs) {
+  if (recs.some((r) => r.toks.length && /^A\)$/.test(r.toks[0].text))) return;
+  const first = new Map();
+  for (const r of recs) {
+    const m = r.toks.length && r.toks[0].text.match(/^([A-J])\.$/);
+    if (m && !first.has(m[1])) first.set(m[1], r.toks[0]);
+  }
+  const run = [];
+  for (let c = 65; first.has(String.fromCharCode(c)); c++) {
+    run.push([String.fromCharCode(c), first.get(String.fromCharCode(c))]);
+  }
+  if (run.length < 2) return;
+  run.forEach(([letter, tok]) => { tok.text = letter + ")"; });
+}
+
+/* ---- the OCR pass over one document ------------------------------------ */
+
+async function ocrDocument(doc, hash, label, onProgress, span) {
+  const Tesseract = await loadTesseract();
+  const n = doc.numPages;
+  // no hash (crypto.subtle needs a secure context) means no cache, not no OCR
+  const db = hash ? await idbOpen() : null;
+  const pages = new Map();
+  const todo = [];
+  for (let p = 1; p <= n; p++) {
+    const rec = db ? await idbGet(db, `${hash}:${OCR_CACHE_VERSION}:${p}`) : null;
+    if (rec && rec.v === OCR_CACHE_VERSION) pages.set(p, rec);
+    else todo.push(p);
+  }
+  const stats = { pages: n, cached: n - todo.length, headerFallback: 0, noHeader: [] };
+  if (!todo.length) {
+    onProgress(`${label} — reading cached text…`, span[1]);
+    return { pages, stats };
+  }
+
+  const nw = Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 4) - 1));
+  const scheduler = Tesseract.createScheduler();
+  const workers = [];
+  const wopts = {
+    workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist/worker.min.js`,
+    corePath: `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESS_VERSION}`,
+  };
+  for (let i = 0; i < nw; i++) {
+    const w = await Tesseract.createWorker("eng", 1, wopts);
+    await w.setParameters({ preserve_interword_spaces: "1" });
+    scheduler.addWorker(w);
+    workers.push(w);
+  }
+
+  const scale = OCR_DPI / 72;
+  let next = 0, done = 0;
+  const say = () => onProgress(
+    `This PDF has no text layer. Recognizing text in your browser ` +
+    `(page ${done} of ${todo.length})…`,
+    span[0] + (span[1] - span[0]) * (done / todo.length) * 0.95);
+  say();
+
+  const needHeader = [];
+  async function pump() {
+    for (;;) {
+      const i = next++;
+      if (i >= todo.length) return;
+      const p = todo[i];
+      const canvas = await renderForOcr(doc, p, scale);
+      const { data } = await scheduler.addJob("recognize", canvas, {},
+                                              { blocks: true, text: true });
+      const hdr = (data.text.match(/Item\s+(\d+)\s+of/) || [])[1] || null;
+      const rec = ocrPageRecord(data, scale, canvas.height, hdr);
+      if (!hdr) needHeader.push(p);
+      pages.set(p, rec);
+      canvas.width = canvas.height = 1;      // release the bitmap
+      if (db) await idbPut(db, `${hash}:${OCR_CACHE_VERSION}:${p}`, rec);
+      done++;
+      say();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(nw + 1, todo.length) }, pump));
+  await Promise.all(workers.map((w) => w.terminate().catch(() => {})));
+  try { await scheduler.terminate(); } catch (e) {}
+
+  /* Pages captured with the browser chrome in dark mode put light text on a
+     dark bar, and whole-page recognition reads nothing there — which loses
+     "Item N of 50" and orphans the page from its item's other screenshots.
+     Re-read just the header strip, enlarged, as a single block of text, and
+     failing that inverted. */
+  if (needHeader.length) {
+    const hw = await Tesseract.createWorker("eng", 1, wopts);
+    await hw.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1" });
+    for (const p of needHeader) {
+      onProgress(`Reading page headers (${needHeader.indexOf(p) + 1} of ${needHeader.length})…`,
+                 span[1] - (span[1] - span[0]) * 0.04);
+      const full = await renderForOcr(doc, p, scale);
+      let found = null;
+      for (const invert of [false, true]) {
+        const strip = headerStrip(full, invert);
+        const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
+        strip.width = strip.height = 1;
+        if (/Item\s+(\d+)\s+of/.test(data.text)) { found = data; break; }
+      }
+      full.width = full.height = 1;
+      if (!found) { stats.noHeader.push(p); continue; }
+      const rec = pages.get(p);
+      const strip = ocrPageRecord(found, scale * 2, full.height, null);
+      // the strip is the page's own top, at twice the scale: its coordinates
+      // already divide back to the same points as the rest of the page
+      rec.L = strip.L.concat(rec.L).sort((a, b) => a.b - b.b);
+      pages.set(p, rec);
+      stats.headerFallback++;
+      if (db) await idbPut(db, `${hash}:${OCR_CACHE_VERSION}:${p}`, rec);
+    }
+    await hw.terminate().catch(() => {});
+  }
+  onProgress(`${label} — done`, span[1]);
+  return { pages, stats };
+}
+
+function headerStrip(canvas, invert) {
+  const h = Math.max(24, Math.round(canvas.height * 0.12));
+  const c = document.createElement("canvas");
+  c.width = canvas.width * 2;
+  c.height = h * 2;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(canvas, 0, 0, canvas.width, h, 0, 0, c.width, c.height);
+  if (invert) {
+    const im = ctx.getImageData(0, 0, c.width, c.height);
+    const d = im.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
+    }
+    ctx.putImageData(im, 0, 0);
+  }
+  return c;
+}
+
+/* ---- serving OCR pages in the shapes the parser already speaks ---------- */
+
+function ocrLines(rec) {
+  // getPageLines returns PDF-space y (larger is higher) and top line first
+  return (rec ? rec.L : []).map((L) => ({
+    y: -L.b, text: L.w.map((w) => w[2]).join(" "),
+  }));
+}
+
+function ocrWords(rec, viewport) {
+  const s = viewport.scale;
+  const raw = [];
+  const itemRects = [];
+  for (const L of (rec ? rec.L : [])) {
+    const base = L.b * s, fs = L.f * s;
+    const y0 = base - fs, y1 = base + 0.25 * fs;
+    for (const w of L.w) {
+      const x0 = w[0] * s, x1 = w[1] * s;
+      itemRects.push([x0, y0, x1, y1]);
+      raw.push({ x0, x1, y0, y1, base, text: w[2], it: false, bd: false });
+    }
+  }
+  raw.sort((a, b) => (Math.round(a.base) - Math.round(b.base)) || (a.x0 - b.x0));
+  raw.itemRects = itemRects;
+  return raw;
+}
+
+/* One accessor for a document's text, whether it has a text layer or was
+   recognized. Everything in parseExam goes through this, so the OCR path and
+   the text path are the same code from here on. */
+function makeSource(doc, ocrPages) {
+  return {
+    doc,
+    numPages: doc.numPages,
+    ocr: !!ocrPages,
+    async lines(p, foldSubscripts) {
+      if (ocrPages) return ocrLines(ocrPages.get(p));
+      return getPageLines(await doc.getPage(p), foldSubscripts);
+    },
+    async text(p) {
+      return (await this.lines(p)).map((l) => l.text).join("\n");
+    },
+    async words(p, viewport) {
+      if (ocrPages) return ocrWords(ocrPages.get(p), viewport);
+      return getPageWords(await doc.getPage(p), viewport);
+    },
+  };
+}
+
 /* ---------------- main ------------------------------------------------- */
 
-async function parseExam(qBytes, aBytes, onProgress) {
+async function parseExam(qBytes, aBytes, onProgress, opts) {
+  opts = opts || {};
   const pdfjs = window.pdfjsLib;
+  // hash first: getDocument transfers the buffers to the pdf.js worker and
+  // leaves them detached, and the OCR cache is keyed on the file's bytes
+  let qHash = null, aHash = null;
+  try {
+    qHash = await sha256Hex(qBytes);
+    aHash = await sha256Hex(aBytes);
+  } catch (e) { qHash = aHash = null; }   // insecure context: no cache, still works
   const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false, disableFontFace: true }).promise;
   const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false, disableFontFace: true }).promise;
   const nq = qdoc.numPages, na = adoc.numPages;
 
+  // A screenshot-only PDF has no text to read, so recognize it up front. This
+  // is the only place tesseract.js is ever fetched.
+  const qImageOnly = await docIsImageOnly(qdoc);
+  const aImageOnly = await docIsImageOnly(adoc);
+  const ocrStats = {};
+  // contentBand keys on the navy chrome bars; a page it can't find them on
+  // falls back to the whole page, which makes stitching align on chrome text.
+  // Worth knowing about, so count them.
+  const bandFallback = { questions: [], answers: [] };
+  let qOcr = null, aOcr = null, base = 0;
+  if (qImageOnly || aImageOnly) {
+    const OCR_BUDGET = 0.55;            // OCR dominates the wall clock
+    const total = (qImageOnly ? nq : 0) + (aImageOnly ? na : 0);
+    let at = 0;
+    if (qImageOnly) {
+      const span = [OCR_BUDGET * at / total, OCR_BUDGET * (at + nq) / total];
+      const r = await ocrDocument(qdoc, qHash, "Questions", onProgress, span);
+      qOcr = r.pages; ocrStats.questions = r.stats; at += nq;
+    }
+    if (aImageOnly) {
+      const span = [OCR_BUDGET * at / total, OCR_BUDGET * (at + na) / total];
+      const r = await ocrDocument(adoc, aHash, "Answer key", onProgress, span);
+      aOcr = r.pages; ocrStats.answers = r.stats;
+    }
+    base = OCR_BUDGET;
+  }
+  const qSrc = makeSource(qdoc, qOcr);
+  const aSrc = makeSource(adoc, aOcr);
+  const prog = (label, f) => onProgress(label, base + (1 - base) * f);
+
   /* -- index the answer key (text only, fast) -- */
   const aTexts = [];
   for (let i = 1; i <= na; i++) {
-    onProgress(`Reading answer key…`, (i - 1) / na * 0.25);
-    aTexts.push(await getPageText(await adoc.getPage(i)));
+    prog(`Reading answer key…`, (i - 1) / na * 0.25);
+    aTexts.push(await aSrc.text(i));
   }
   // An answer can span several screenshots. Group them so the whole answer is
   // shown, but keep matching on each marked shot's own stem, as page-at-a-time
@@ -805,16 +1580,16 @@ async function parseExam(qBytes, aBytes, onProgress) {
   let title = "Self-Assessment";
   const qTexts = [];
   for (let i = 1; i <= nq; i++) {
-    onProgress(`Reading questions…`, 0.25 + (i - 1) / nq * 0.05);
-    qTexts.push(await getPageText(await qdoc.getPage(i)));
+    prog(`Reading questions…`, 0.25 + (i - 1) / nq * 0.05);
+    qTexts.push(await qSrc.text(i));
   }
   const qGroups = groupPages(qTexts.map(itemNumber)).map((g) => g.map((i) => i + 1));
 
   for (let gi = 0; gi < qGroups.length; gi++) {
     const group = qGroups[gi];
     const pno = group[0];
-    onProgress(`Preparing question ${gi + 1} of ${qGroups.length}…`,
-               0.3 + gi / qGroups.length * 0.7);
+    prog(`Preparing question ${gi + 1} of ${qGroups.length}…`,
+         0.3 + gi / qGroups.length * 0.7);
     const shots = [];
     for (const p of group) {
       const page = await qdoc.getPage(p);
@@ -825,8 +1600,10 @@ async function parseExam(qBytes, aBytes, onProgress) {
       const cx = c.getContext("2d", { willReadFrequently: true });
       await renderPage(page, viewport, cx);
       const im = cx.getImageData(0, 0, w, h);
-      shots.push({ canvas: c, img: im, w, h, band: contentBand(im.data, w, h),
-                   words: await getPageWords(page, viewport) });
+      const band = contentBand(im.data, w, h);
+      if (band[0] === 0 && band[1] === h) bandFallback.questions.push(p);
+      shots.push({ canvas: c, img: im, w, h, band,
+                   words: await qSrc.words(p, viewport) });
     }
     const st = stitchShots(shots);
     const canvas = st.canvas, img = st.img, rawWords = st.words;
@@ -870,8 +1647,10 @@ async function parseExam(qBytes, aBytes, onProgress) {
       const rowBot = idx + 1 < ordered.length
         ? ordered[idx + 1][1].y0 - rad * 0.6
         : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      // cx/cy/rad let extendFiguresBelow mask the radio circles, the only ink
+      // below the stem that no text box covers
       pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0, lx1: bx.x1,
-                       base: bx.base, tol: (bx.y1 - bx.y0) * 0.4 });
+                       base: bx.base, tol: (bx.y1 - bx.y0) * 0.4, cx, cy, rad });
       const rowLeft = cx - rad * 1.6;
       const rowRight = cw * 0.99;
       choices.push({
@@ -907,7 +1686,9 @@ async function parseExam(qBytes, aBytes, onProgress) {
                                        canvas, img);
     } catch (e) { content = null; }
 
-    if (content) {
+    // keepPageImages: the test harness wants the page render even for items
+    // that parsed as text, to compare the HTML against the original layout.
+    if (content && !opts.keepPageImages) {
       qURLs.push(null);
     } else {
       // cropped content image -> blob URL (fallback rendering)
@@ -930,7 +1711,7 @@ async function parseExam(qBytes, aBytes, onProgress) {
       a_pages: aGroup === null ? [] : aGroups[aGroup],
     });
   }
-  onProgress("Done", 1);
+  prog("Done", 1);
 
   /* -- lazy answer-page rendering -- */
   const aCache = new Map();
@@ -948,9 +1729,10 @@ async function parseExam(qBytes, aBytes, onProgress) {
       const cx = c.getContext("2d", { willReadFrequently: true });
       await renderPage(page, viewport, cx);
       const im = cx.getImageData(0, 0, c.width, c.height);
-      shots.push({ canvas: c, img: im, w: c.width, h: c.height,
-                   band: contentBand(im.data, c.width, c.height),
-                   words: await getPageWords(page, viewport) });
+      const band = contentBand(im.data, c.width, c.height);
+      if (band[0] === 0 && band[1] === c.height) bandFallback.answers.push(p);
+      shots.push({ canvas: c, img: im, w: c.width, h: c.height, band,
+                   words: await aSrc.words(p, viewport) });
     }
     const url = await new Promise((res) =>
       stitchShots(shots).canvas.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
@@ -974,7 +1756,7 @@ async function parseExam(qBytes, aBytes, onProgress) {
       const all = [];
       let shift = 0, prevLast = null;
       for (const p of it.a_pages) {
-        const pl = await getPageLines(await adoc.getPage(p), true);
+        const pl = await aSrc.lines(p, true);
         if (!pl.length) continue;
         if (prevLast !== null) shift = prevLast + 14 - pl[0].y;
         for (const l of pl) all.push({ ...l, y: l.y + shift });
@@ -1024,7 +1806,8 @@ async function parseExam(qBytes, aBytes, onProgress) {
     return info;
   }
 
-  return { count: items.length, title, items, qURLs, answerURL, answerInfo };
+  return { count: items.length, title, items, qURLs, answerURL, answerInfo,
+           ocr: ocrStats, bandFallback };
 }
 
 window.parseExam = parseExam;
