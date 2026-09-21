@@ -118,8 +118,20 @@ def _similarity(a: str, b: str) -> float:
     return 2 * shared / total
 
 
+# The key's lead line normally reads "Correct Answer: G.", but the colon is a
+# glyph of its own and some exports lose it: Surgery 3 item 24 prints
+# "Correct Answer G." and the item came out with no key at all. The separator
+# is therefore optional, which means the pattern must refuse
+# "Incorrect Answers: A, B, C" on its own merits -- once by what precedes
+# "Correct" and once by the plural "Answers" -- and must take a letter that
+# stands alone, never the initial of the next word.
+_CORRECT_ANSWER = re.compile(
+    r"(?:^|[^A-Za-z])Correct\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])"
+)
+
+
 def _correct_letter(text: str) -> str | None:
-    m = re.search(r"Correct\s*Answer:\s*([A-Z])", text)
+    m = _CORRECT_ANSWER.search(text)
     return m.group(1) if m else None
 
 
@@ -187,6 +199,68 @@ def _choice_columns(ordered, cw: float) -> list[list[int]]:
     for m in cols:
         m.sort(key=lambda i: ordered[i][1][1])
     return cols
+
+
+def _line_groups(words: list[dict]) -> list[dict]:
+    """Cluster positioned words into visual lines, top to bottom.
+
+    Same clustering docs/parser.js does before it reflows a page, kept here so
+    both parsers see the same lines when they decide where the stem is.
+    """
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: ((w["y0"] + w["y1"]) / 2, w["x0"]))
+    heights = sorted(w["y1"] - w["y0"] for w in ws)
+    tol = max(heights[len(heights) // 2] * 0.5, 2.0)
+    lines: list[dict] = []
+    for w in ws:
+        cy = (w["y0"] + w["y1"]) / 2
+        if lines and abs(cy - lines[-1]["cy"]) <= tol:
+            lines[-1]["words"].append(w)
+        else:
+            lines.append({"cy": cy, "words": [w]})
+    for ln in lines:
+        ln["words"].sort(key=lambda w: w["x0"])
+        ln["x0"] = min(w["x0"] for w in ln["words"])
+        ln["x1"] = max(w["x1"] for w in ln["words"])
+        ln["y0"] = min(w["y0"] for w in ln["words"])
+        ln["y1"] = max(w["y1"] for w in ln["words"])
+    return lines
+
+
+def _stem_below_choices(words, ordered, bottom: float):
+    """The first stem line printed BELOW the answer choices, or None.
+
+    A matching set ("For each patient with a limp, select the most likely
+    diagnosis.") prints its shared lead-in, then the whole lettered list, and
+    only then the patient's vignette, so the page is choices-then-stem. Reading
+    it as stem-then-choices gives the item no stem and hands the vignette to
+    the last choice, whose band runs to the foot of the page.
+
+    A wrapped continuation line of the last choice is indented to the choice
+    text, while stem prose starts at the page's left margin, left of even the
+    choice letters -- that is what tells the two apart. A line of button
+    glyphs above the footer bar is not stem text either, so the block found
+    has to be a real paragraph's worth of words.
+    """
+    if not ordered:
+        return None
+    label_left = min(bx[0] for _, bx in ordered)
+    last = max((bx for _, bx in ordered), key=lambda b: (b[1] + b[3]) / 2)
+    floor = (last[1] + last[3]) / 2 + (last[3] - last[1]) * 0.5
+    below = [w for w in words
+             if (w["y0"] + w["y1"]) / 2 > floor and w["y1"] <= bottom
+             and re.search(r"[A-Za-z0-9]", w["text"])]
+    if not below:
+        return None
+    lines = _line_groups(below)
+    for i, ln in enumerate(lines):
+        if ln["x0"] >= label_left - 4:
+            continue
+        wordy = sum(1 for L in lines[i:] for w in L["words"]
+                    if re.search(r"[A-Za-z]{3,}", w["text"]))
+        return ln if wordy >= 10 else None
+    return None
 
 
 def _radio_for_letter(arr: np.ndarray, lbox: tuple[float, float, float, float]):
@@ -454,6 +528,10 @@ class ExamParser:
 
         radios = [_radio_for_letter(arr, bx) for _, bx in ordered]
         cols = _choice_columns(ordered, cw)
+        # a matching set prints its choices above the vignette; the bottom
+        # choice's row must stop where that stem text starts
+        stem_line = _stem_below_choices(words, ordered, bottom)
+        body_top = stem_line["y0"] - 2 if stem_line else None
         col_of = {}
         for ci, members in enumerate(cols):
             for i in members:
@@ -476,6 +554,8 @@ class ExamParser:
                 row_bot = nbx[1] - rad * 0.6
             else:
                 row_bot = bx[3] + (bx[3] - bx[1]) * 1.4
+            if body_top is not None:
+                row_bot = min(row_bot, body_top)
             row_left = cx - rad * 1.6
             row_right = col_right[col_of[idx]]
             row = [row_left / cw, (row_top - top) / ch,

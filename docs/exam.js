@@ -1135,13 +1135,15 @@ function renderExplanation(info) {
     // the key's lead line is sometimes its own paragraph ("Correct Answer: A.")
     // and sometimes runs straight on into the discussion; only the lead line
     // itself should get the green heading treatment.
-    const lead = /^(Correct Answer\s*:\s*[A-Z]\s*\.?)([\s\S]*)$/.exec(p);
+    // the colon is a glyph of its own and some exports lose it entirely
+    // ("Correct Answer G."), so it is optional here too
+    const lead = /^(Correct Answer\s*[:.]?\s*[A-Z]\s*\.?)([\s\S]*)$/.exec(p);
     if (lead) {
       const rest = lead[2].trim();
       return `<p class="ans-correct">${escHtml(lead[1])}</p>` +
              (rest ? `<p>${escHtml(rest)}</p>` : "");
     }
-    if (/^Correct Answer\s*:/.test(p)) return `<p class="ans-correct">${html}</p>`;
+    if (/^Correct Answer\s*[:.]?\s*[A-Z]\b/.test(p)) return `<p class="ans-correct">${html}</p>`;
     html = html.replace(/^(Incorrect Answers:|Educational Objective:)/, "<b>$1</b>");
     return `<p>${html}</p>`;
   }).join("");

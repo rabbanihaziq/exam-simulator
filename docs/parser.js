@@ -44,8 +44,19 @@ function itemNumber(text) {
   return null;
 }
 
+/* The key's lead line normally reads "Correct Answer: G.", but the colon is a
+   glyph of its own and some exports lose it: Surgery 3 item 24 prints
+   "Correct Answer G." and the item came out with no key at all. The separator
+   is therefore optional, which means the pattern must refuse
+   "Incorrect Answers: A, B, C" on its own merits — once by what precedes
+   "Correct" and once by the plural "Answers" — and must take a letter that
+   stands alone, never the initial of the next word. Written without a
+   lookbehind so older Safari still parses this file. */
+const CORRECT_ANSWER =
+  /(?:^|[^A-Za-z])Correct\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])/;
+
 function correctLetter(text) {
-  const m = text.match(/Correct\s*Answer:\s*([A-Z])/);
+  const m = text.match(CORRECT_ANSWER);
   return m ? m[1] : null;
 }
 
@@ -441,10 +452,48 @@ function choiceColumns(ordered, cw) {
   return cols;
 }
 
+/* The first stem line printed BELOW the answer choices, or null.
+
+   A matching set ("For each patient with a limp, select the most likely
+   diagnosis.") prints its shared lead-in, then the whole lettered list, and
+   only then the patient's vignette, so the page reads choices-then-stem.
+   Taking it as stem-then-choices gives the item no stem of its own and hands
+   the vignette to the last choice, whose text band runs to the foot of the
+   page — which is how "I) Toxic synovitis A previously healthy 14-year-old
+   boy…" reached the results export.
+
+   A wrapped continuation line of the last choice is indented to the choice
+   text, while stem prose starts at the page's left margin, left of even the
+   choice letters — that is what tells the two apart. The button glyphs above
+   the footer bar are not stem text either, so what is found below has to be a
+   real paragraph's worth of words. Port of _stem_below_choices in
+   app/parsing/parser.py. */
+function stemBelowChoices(raw, ordered, bottom) {
+  if (!ordered.length) return null;
+  const labelLeft = Math.min(...ordered.map(([, b]) => b.x0));
+  let last = ordered[0][1];
+  for (const [, b] of ordered) if (b.base > last.base) last = b;
+  const floor = last.base + (last.y1 - last.y0) * 0.4;
+  const below = raw.filter((w) => w.base > floor && w.y1 <= bottom &&
+                                  /[A-Za-z0-9]/.test(w.text));
+  if (!below.length) return null;
+  const lines = clusterTextLines(below);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].x0 >= labelLeft - 4) continue;
+    let wordy = 0;
+    for (let k = i; k < lines.length; k++) {
+      for (const w of lines[k].words) if (/[A-Za-z]{3,}/.test(w.text)) wordy++;
+    }
+    return wordy >= 10 ? lines[i] : null;
+  }
+  return null;
+}
+
 /* Build the structured content for one question page: stem paragraphs with
    inline figure crops, plus per-choice text runs. Returns null when the page
    doesn't extract cleanly (caller falls back to image mode). */
-async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
+async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
+                                bodyBase) {
   if (!pxChoices.length) return null;
   // The topmost choice, not choice A: with the choices in two columns the
   // right column's first label can sit a few pixels above A's.
@@ -455,7 +504,14 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
   // `y1 <= rowTop` and vanished from the text render entirely. The choice rows
   // below are already bounded by baselines for the same reason.
   const stemLimit = Math.min(...pxChoices.map((c) => c.base - c.tol));
-  const stemWords = raw.filter((w) => w.y0 >= top - 2 && w.base < stemLimit);
+  // bodyBase: the baseline of the first stem line printed BELOW the choices
+  // (a matching set, see stemBelowChoices). Those lines are stem too — they
+  // are the item's whole vignette — so they join the stem here and are kept
+  // out of the last choice's band further down.
+  const belowFrom = bodyBase == null ? null : bodyBase - 2;
+  const stemWords = raw.filter((w) => w.y0 >= top - 2 &&
+    (w.base < stemLimit ||
+     (belowFrom !== null && w.base >= belowFrom && w.y1 <= top + ch)));
   if (stemWords.length < 5) return null;
 
   // ---- figures: ink regions outside every text box, then column blocks -----
@@ -647,8 +703,14 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
         const ovX = Math.min(f.x1, p.x1) - Math.max(f.x0, p.x0);
         const xFrac = ovX / Math.max(1, p.x1 - p.x0);
         const within = p.x0 >= f.x0 - 24 && p.x1 <= f.x1 + 24;
+        // On a matching-set page the short paragraph under the boxed
+        // "The response options for the next N items are the same" notice is
+        // the set's lead-in, not that box's caption: keeping it as text is the
+        // difference between an item whose stem reads "For each patient with a
+        // limp…" and one that starts mid-vignette.
+        const captionBelow = !(bodyBase != null && p.y0 > f.y1);
         if ((ovY > (p.y1 - p.y0) * 0.5 && xFrac > 0.3 && (within || short)) ||
-            (short && xFrac > 0.6 && ovY > -pitch * 1.2)) {
+            (short && xFrac > 0.6 && ovY > -pitch * 1.2 && captionBelow)) {
           p.consumed = true;
           f.y0 = Math.min(f.y0, p.y0 - 4); f.y1 = Math.max(f.y1, p.y1 + 4);
           f.x0 = Math.min(f.x0, p.x0 - 4); f.x1 = Math.max(f.x1, p.x1 + 4);
@@ -740,7 +802,10 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData) {
     // two-column left column a negative-height band (its "next" letter is the
     // right column's top one), which emptied it and dropped the item to image
     // mode. colRight keeps the run out of the neighbouring column.
-    const to = pc.nextBase != null ? pc.nextBase - pc.nextTol : top + ch;
+    // …and the last one stops at the stem below it on a matching-set page,
+    // instead of running the vignette into the choice's own text.
+    let to = pc.nextBase != null ? pc.nextBase - pc.nextTol : top + ch;
+    if (pc.nextBase == null && belowFrom !== null) to = Math.min(to, belowFrom);
     const colRight = pc.colRight == null ? Infinity : pc.colRight;
     const cws = raw.filter((w) => {
       if (!(w.base >= from && w.base < to)) return false;
@@ -1705,6 +1770,10 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
 
     const choices = [];
     const pxChoices = [];
+    // A matching set prints its choices above the vignette; the bottom
+    // choice's row and text band both have to stop where that stem starts.
+    const stemLine = stemBelowChoices(rawWords, ordered, bottom);
+    const bodyTop = stemLine ? stemLine.y0 - 2 : null;
     // Radios first: a column's right edge is the next column's leftmost radio.
     const radios = ordered.map(([, bx]) =>
       radioForLetter(img.data, w, h, [bx.x0, bx.y0, bx.x1, bx.y1]));
@@ -1725,7 +1794,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       const nx = col.members[col.members.indexOf(idx) + 1];
       const nbx = nx === undefined ? null : ordered[nx][1];
       const rowTop = bx.y0 - rad * 0.6;
-      const rowBot = nbx ? nbx.y0 - rad * 0.6 : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      let rowBot = nbx ? nbx.y0 - rad * 0.6 : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      if (bodyTop !== null) rowBot = Math.min(rowBot, bodyTop);
       // cx/cy/rad let extendFiguresBelow mask the radio circles, the only ink
       // below the stem that no text box covers
       pxChoices.push({ letter: L, rowTop, rowBot, lx0: bx.x0, lx1: bx.x1,
@@ -1765,7 +1835,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     let content = null;
     try {
       content = await buildItemContent(rawWords, pxChoices, top, cw, ch,
-                                       canvas, img);
+                                       canvas, img,
+                                       stemLine ? stemLine.base : null);
     } catch (e) { content = null; }
 
     // keepPageImages: the test harness wants the page render even for items
@@ -1852,7 +1923,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
         seenLine.add(k);
         return true;
       });
-      const start = lines.findIndex((l) => /Correct\s*Answer\s*:/.test(l.text));
+      const start = lines.findIndex((l) => CORRECT_ANSWER.test(l.text));
       if (start >= 0) {
         const CHROME = /Time Remaining|Exam Section|^\s*(Previous|Next|Highlight|Lab Values|Calculator|Navigator|End Block|Mark)\b/;
         const body = lines.slice(start)
