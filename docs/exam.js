@@ -87,8 +87,8 @@ async function sha16(bytes) {
 async function startExam() {
   const qf = $("file-q").files[0];
   const af = $("file-a").files[0];
-  if (!qf || !af) {
-    showError("Please choose both a questions PDF and an answer-key PDF.");
+  if (!qf) {
+    showError("Please choose a questions PDF.");
     return;
   }
   if (!window.pdfjsLib) {
@@ -103,7 +103,9 @@ async function startExam() {
 
   try {
     const qBytes = await qf.arrayBuffer();
-    const aBytes = await af.arrayBuffer();
+    // no answer key: an unscored practice sitting, every item marked
+    // "not in answer key" and left out of the percentage
+    const aBytes = af ? await af.arrayBuffer() : null;
     const sid = await sha16(qBytes.slice(0));
     const data = await window.parseExam(qBytes, aBytes, (label, frac) => {
       $("progressLabel").textContent = label;
@@ -116,8 +118,9 @@ async function startExam() {
     $("app").style.display = "flex";
     boot(data);
   } catch (e) {
-    showError("Could not read those PDFs (" + (e.message || e) + "). Make sure " +
-      "they are the self-assessment questions and answer-key PDFs.");
+    showError("Could not read that PDF (" + (e.message || e) + "). Make sure " +
+      "it is the self-assessment questions PDF (and, if you chose one, the " +
+      "matching answer-key PDF).");
   }
 }
 

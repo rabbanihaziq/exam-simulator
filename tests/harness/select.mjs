@@ -65,6 +65,9 @@ await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
 
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: true,
+  // an image-only PDF is OCR'd in the page; that one evaluate() call runs for
+  // minutes and the 180s default protocol timeout would kill the run
+  protocolTimeout: 0,
   args: ["--no-sandbox", "--disable-dev-shm-usage", "--window-size=1800,1300"],
 });
 const page = await browser.newPage();

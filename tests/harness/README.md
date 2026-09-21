@@ -9,7 +9,12 @@ needed to diff a parser change and to look at what it actually produced.
 cd "<repo>"
 npm install --prefix tests/harness          # once: puppeteer-core
 node tests/harness/run.mjs "<questions.pdf>" "<answers.pdf>" <outdir>
+node tests/harness/run.mjs "<questions.pdf>" - <outdir>   # no answer key
 ```
+
+A form shared without its answer key parses unscored: pass `-` in the answer
+PDF's place (or leave it out and give the output directory second) and every
+item comes back `answer_available: false`.
 
 `HARNESS_PORT=8766` picks another port (default 8765) so two runs can overlap.
 `HARNESS_PROFILE=<dir>` reuses a Chrome profile instead of a throwaway one, so a

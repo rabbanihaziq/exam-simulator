@@ -63,9 +63,13 @@ def index():
 def start():
     qf = request.files.get("questions")
     af = request.files.get("answers")
-    if not qf or not af or qf.filename == "" or af.filename == "":
+    # The answer key is optional: without it the sitting runs unscored, with
+    # every item flagged as having no key.
+    if af is not None and af.filename == "":
+        af = None
+    if not qf or qf.filename == "":
         return render_template("index.html",
-                               error="Please choose both a questions PDF and an answer-key PDF."), 400
+                               error="Please choose a questions PDF."), 400
     try:
         duration = int(request.form.get("minutes", "75"))
     except ValueError:
@@ -76,16 +80,18 @@ def start():
     qpath = os.path.join(UPLOAD_DIR, f"{token}_q.pdf")
     apath = os.path.join(UPLOAD_DIR, f"{token}_a.pdf")
     qf.save(qpath)
-    af.save(apath)
+    if af:
+        af.save(apath)
 
     try:
-        parser = ExamParser(qpath, apath)
+        parser = ExamParser(qpath, apath if af else None)
         parser.parse()
     except Exception as e:  # pragma: no cover - surface parse failures to user
         return render_template(
             "index.html",
-            error=f"Could not read those PDFs ({e}). Make sure they are the "
-                  f"self-assessment questions and answer-key PDFs."), 400
+            error=f"Could not read that PDF ({e}). Make sure it is the "
+                  f"self-assessment questions PDF (and, if you chose one, the "
+                  f"matching answer-key PDF)."), 400
 
     with _LOCK:
         _EXAMS[token] = parser

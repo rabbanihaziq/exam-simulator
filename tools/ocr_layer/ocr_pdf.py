@@ -412,7 +412,11 @@ def header_fallback(path: str, W: int, H: int, ocr_fn):
 # Text-layer construction (shared by both engines)
 # --------------------------------------------------------------------------- #
 
-HEADER_RE = re.compile(r"Item\s+(\d+)\s+of")
+# Two share formats, two page headers: the NBME client prints
+# "Exam Section : Item 7 of 50", the app the ObGyn forms come from prints
+# "Question 7 Of 50 (03:41)". Either one names the item the page belongs to.
+# The space can be lost by OCR ("Question 35Of Of 50"), so it is optional.
+HEADER_RE = re.compile(r"(?:Item|Question)\s*(\d+)\s*[Oo]f\b")
 LETTER = re.compile(r"^[A-J]\)$")
 # The answer key prints a red X before a wrongly answered item's number; OCR
 # reads it as one of these.
@@ -509,7 +513,7 @@ def build_layer(doc: fitz.Document, records: list[dict], out: str,
         # scroll screenshots together, so it must reach the text layer.
         hdr = None
         for l in rec["lines"]:
-            m = re.search(r"Item\s+(\d+)\s+of", l["text"])
+            m = HEADER_RE.search(l["text"])
             if m:
                 hdr = m.group(1)
                 break
@@ -687,7 +691,8 @@ def run(inp: str, out: str, engine: str, dpi: int, jobs: int,
         nohdr = [i for i, r in enumerate(records)
                  if not any(HEADER_RE.search(l["text"]) for l in r["lines"])]
         if nohdr:
-            print(f"  WARNING: no \"Item N of 50\" header on pages {nohdr} -- "
+            print(f"  WARNING: no \"Item N of 50\"/\"Question N Of 50\" header on "
+                  f"pages {nohdr} -- "
                   f"those pages cannot be stitched to an item")
 
         stats = build_layer(doc, records, out, fontname, fontfile)

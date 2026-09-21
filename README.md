@@ -5,7 +5,15 @@ faithful, exam-style testing interface — take the exam blind, then review your
 answers against the key with a % score.
 
 It works with any self-assessment exported in the standard page-per-item
-layout; nothing is hard-coded to a single form. You supply your own PDFs.
+layout; nothing is hard-coded to a single form. Both common share formats are
+read: the NBME client's own pages ("Exam Section : Item 7 of 50", choices
+labelled "A)") and the wide landscape export whose header reads
+"Question 7 Of 50" and whose choices are labelled "A.". You supply your own
+PDFs.
+
+The answer-key PDF is optional. Without one the sitting still runs — timer,
+marks, highlights and all — every item is flagged "not in answer key," and
+there is no score.
 
 ## Use it in your browser (easiest)
 

@@ -54,7 +54,7 @@
   <div class="wrap">
     <div class="card">
       <h1>Self-Assessment Exam Simulator</h1>
-      <p class="sub">Load a questions PDF and its answer-key PDF to start a timed, exam-style session.</p>
+      <p class="sub">Load a questions PDF and its answer-key PDF to start a timed, exam-style session. Without the answer key the sitting still works; it just isn't scored.</p>
       <div class="err" id="err"></div>
 
       <label class="f">Questions PDF <span class="hint">— the unlabeled exam you take blind</span></label>
@@ -64,10 +64,10 @@
         <input type="file" id="file-q" accept="application/pdf">
       </label>
 
-      <label class="f">Answer-key PDF <span class="hint">— the version with correct answers &amp; explanations</span></label>
+      <label class="f">Answer-key PDF <span class="hint">— optional; the version with correct answers &amp; explanations</span></label>
       <label class="drop" id="drop-a">
         <span class="ic">🔑</span>
-        <span class="txt" id="txt-a"><b>Click to choose</b> or drop the answer-key PDF here</span>
+        <span class="txt" id="txt-a"><b>Click to choose</b> or drop the answer-key PDF here — leave empty to practice unscored</span>
         <input type="file" id="file-a" accept="application/pdf">
       </label>
 

@@ -25,6 +25,10 @@ function normText(s) {
   // spaces in the chrome pattern below.
   s = s.replace(/\u00a0/g, " ");
   s = s.replace(/Exam Section[\s\S]*?Self-Assessment/g, " ");
+  // the other share format's header: "Question 7 Of 50 (03:41)". The timer
+  // differs between a question page and its answer page, so it has to go
+  // before the two stems are compared.
+  s = s.replace(/Question\s*\d+\s*[Oo]f\s*\d+\s*\(?[\d:]*\)?/g, " ");
   s = s.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
   return s.replace(/\s+/g, " ").trim();
 }
@@ -36,8 +40,14 @@ function stemKey(text) {
   return normText(t).slice(0, 350);
 }
 
+/* Two share formats, two page headers: the NBME client prints
+   "Exam Section : Item 7 of 50", the app the ObGyn forms come from prints
+   "Question 7 Of 50 (03:41)". Either one names the item the page belongs to.
+   The space can be lost by OCR ("Question 35Of Of 50"), so it is optional. */
+const HEADER_ITEM = /(?:Item|Question)\s*(\d+)\s*[Oo]f\b/;
+
 function itemNumber(text) {
-  let m = text.match(/Item\s+(\d+)\s+of/);
+  let m = text.match(HEADER_ITEM);
   if (m) return parseInt(m[1], 10);
   m = text.match(/(?:^|\n)\s*(\d+)\s*[.)]\s+[A-Z(]/);
   if (m) return parseInt(m[1], 10);
@@ -102,6 +112,29 @@ function contentBand(data, w, h) {
   const botBand = dark.filter((y) => y > h * 0.78);
   if (topBand.length) top = Math.max(...topBand) + 1;
   if (botBand.length) bottom = Math.min(...botBand);
+  if (top === 0 && bottom === h) {
+    // No navy bars at all: the ObGyn share app draws its header and its
+    // toolbar as flat light-grey strips on a white page. The content is what
+    // is white, so walk in from each edge while the rows are not — which
+    // steps over the toolbar's coloured icons, where a rule looking for grey
+    // rows alone stops short and leaves "Define" in the stem.
+    const whiteRow = (y) => {
+      let wh = 0, n = 0;
+      const row = y * w * 4;
+      for (let x = 0; x < w; x += 2) {
+        const i = row + x * 4;
+        if (data[i] >= 253 && data[i + 1] >= 253 && data[i + 2] >= 253) wh++;
+        n++;
+      }
+      return wh / n > 0.6;
+    };
+    let y = 0;
+    while (y < h * 0.22 && !whiteRow(y)) y++;
+    top = y;
+    y = h - 1;
+    while (y > h * 0.78 && !whiteRow(y)) y--;
+    bottom = y + 1;
+  }
   if (bottom - top < h * 0.3) return [0, h];
   return [top, bottom];
 }
@@ -812,7 +845,7 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
       if (w.x0 < pc.lx0 - 2 || w.x0 >= colRight) return false;
       // lw is the label token itself; comparing text would miss the O label,
       // which some text layers spell "0)"
-      if (w === pc.lw || w.text === pc.letter + ")") return false;
+      if (w === pc.lw || w === pc.lw.src || w.text === pc.letter + ")") return false;
       // a label OCR'd inside the exhibit (an "R" orientation marker on an
       // x-ray) can share a choice's baseline; it belongs to the figure
       const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
@@ -841,6 +874,65 @@ const MIN_ANCHOR_LEN = 5;   // shorter text repeats too often to anchor on
 const REFINE_RADIUS = 8;    // px the pixel search may move a text offset
 const STRIDE = 4;           // column stride for pixel comparisons
 
+/* The contiguous run of choice labels A, B, C, ... on one page.
+
+   `rx` spells a label: "A)" on the NBME client, "A." on the app the ObGyn
+   forms come from, either of them with the unticked radio circle fused onto
+   the front ("OA.", "OI."). Only the topmost occurrence of each letter counts,
+   and never one above choice A's own line — "37.0C (98.6F)" in a vitals table
+   hands us an "F)" token a third of a page above the real choices, and a
+   phantom F both invents a sixth choice and puts the run out of reading order.
+   A second column's first label shares A's line, so a line of slack is
+   allowed. Port of _choice_run in app/parsing/parser.py. */
+// The unticked radio circle, as OCR reads it: "O", "(O", "(OO", "©", "()"…
+const LABEL_JUNK = /^[O0Qo\u00a9\u00ae\u2022()\[\]{}.,_|\-\u2013\u2014]{1,4}$/;
+
+function choiceRun(raw, top, bottom, rx, lineInitial) {
+  const cands = new Map();
+  for (const wd of raw) {
+    const m = wd.text.match(rx);
+    if (!m) continue;
+    if (wd.y0 < top || wd.y1 > bottom) continue;
+    // A label opens its row. Only the radio circle, when OCR read it as a
+    // token of its own, may sit to its left. Without this a choice ending in
+    // "...vitamin E." would be read as the next choice in the run — which is
+    // why the bracketed spelling, unambiguous on its own, does not ask for it
+    // (a two-column grid's right-hand labels share a row with the left's).
+    if (lineInitial) {
+      const tol = (wd.y1 - wd.y0) * 0.5;
+      const left = raw.filter((o) => o !== wd && Math.abs(o.base - wd.base) <= tol &&
+                                     o.x1 <= wd.x0 + 2);
+      if (!left.every((o) => LABEL_JUNK.test(o.text))) continue;
+    }
+    const L = m[1] === "0" ? "O" : m[1];
+    // an unticked radio circle read as part of the label — keep the right
+    // edge, since the circle sits in the part being dropped, and remember the
+    // token itself so the choice's own text can still exclude it
+    const bx = wd.text.length > 2
+      ? { ...wd, x0: wd.x1 - (wd.x1 - wd.x0) * 2 / wd.text.length, src: wd }
+      : wd;
+    if (!cands.has(L)) cands.set(L, []);
+    cands.get(L).push(bx);
+  }
+  for (const list of cands.values()) list.sort((a, b) => a.y0 - b.y0);
+  const boxes = new Map();
+  const aList = cands.get("A");
+  if (aList) {
+    const floor = aList[0].base - (aList[0].y1 - aList[0].y0);
+    for (const [L, list] of cands) {
+      const b = list.find((wd) => wd.base >= floor);
+      if (b) boxes.set(L, b);
+    }
+  }
+  const ordered = [];
+  let code = 65;
+  while (boxes.has(String.fromCharCode(code))) {
+    ordered.push([String.fromCharCode(code), boxes.get(String.fromCharCode(code))]);
+    code++;
+  }
+  return ordered;
+}
+
 /* Consecutive pages sharing one header item number become one group. */
 function groupPages(nums) {
   const groups = [];
@@ -850,6 +942,22 @@ function groupPages(nums) {
     else groups.push([i]);
   });
   return groups;
+}
+
+/* One group of 1-based page numbers per item, skipping pages that belong to
+   no item at all: ObGyn Form 9's export carries a 1004x30 strip (a Touch Bar
+   screenshot caught by the capture), which names no item and holds no text,
+   and which would otherwise become an item of its own and shift every item
+   after it by one. Port of ExamParser._groups. */
+function itemGroups(texts) {
+  const pages = [], nums = [];
+  texts.forEach((t, i) => {
+    const n = itemNumber(t);
+    if (n === null && (t.match(/[A-Za-z]{2,}/g) || []).length < 10) return;
+    pages.push(i + 1);
+    nums.push(n);
+  });
+  return groupPages(nums).map((g) => g.map((i) => pages[i]));
 }
 
 /* Content words long enough to anchor on, keyed by text, uniques only. */
@@ -1470,7 +1578,7 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
       const canvas = await renderForOcr(doc, p, scale);
       const { data } = await scheduler.addJob("recognize", canvas, {},
                                               { blocks: true, text: true });
-      const hdr = (data.text.match(/Item\s+(\d+)\s+of/) || [])[1] || null;
+      const hdr = (data.text.match(HEADER_ITEM) || [])[1] || null;
       const rec = ocrPageRecord(data, scale, canvas.height, hdr);
       if (!hdr) needHeader.push(p);
       pages.set(p, rec);
@@ -1501,7 +1609,7 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
         const strip = headerStrip(full, invert);
         const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
         strip.width = strip.height = 1;
-        if (/Item\s+(\d+)\s+of/.test(data.text)) { found = data; break; }
+        if (HEADER_ITEM.test(data.text)) { found = data; break; }
       }
       full.width = full.height = 1;
       if (!found) { stats.noHeader.push(p); continue; }
@@ -1598,16 +1706,21 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   let qHash = null, aHash = null;
   try {
     qHash = await sha256Hex(qBytes);
-    aHash = await sha256Hex(aBytes);
+    if (aBytes) aHash = await sha256Hex(aBytes);
   } catch (e) { qHash = aHash = null; }   // insecure context: no cache, still works
   const qdoc = await pdfjs.getDocument({ data: qBytes, useSystemFonts: false, disableFontFace: true }).promise;
-  const adoc = await pdfjs.getDocument({ data: aBytes, useSystemFonts: false, disableFontFace: true }).promise;
-  const nq = qdoc.numPages, na = adoc.numPages;
+  // The answer key is optional: a form whose key has not been shared yet still
+  // makes a usable practice sitting, with every item flagged as having no key
+  // and left out of the score.
+  const adoc = aBytes
+    ? await pdfjs.getDocument({ data: aBytes, useSystemFonts: false, disableFontFace: true }).promise
+    : null;
+  const nq = qdoc.numPages, na = adoc ? adoc.numPages : 0;
 
   // A screenshot-only PDF has no text to read, so recognize it up front. This
   // is the only place tesseract.js is ever fetched.
   const qImageOnly = await docIsImageOnly(qdoc);
-  const aImageOnly = await docIsImageOnly(adoc);
+  const aImageOnly = adoc ? await docIsImageOnly(adoc) : false;
   const ocrStats = {};
   // contentBand keys on the navy chrome bars; a page it can't find them on
   // falls back to the whole page, which makes stitching align on chrome text.
@@ -1631,7 +1744,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     base = OCR_BUDGET;
   }
   const qSrc = makeSource(qdoc, qOcr);
-  const aSrc = makeSource(adoc, aOcr);
+  const aSrc = adoc ? makeSource(adoc, aOcr) : null;
   const prog = (label, f) => onProgress(label, base + (1 - base) * f);
 
   /* -- index the answer key (text only, fast) -- */
@@ -1643,7 +1756,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   // An answer can span several screenshots. Group them so the whole answer is
   // shown, but keep matching on each marked shot's own stem, as page-at-a-time
   // indexing did.
-  const aGroups = groupPages(aTexts.map(itemNumber)).map((g) => g.map((i) => i + 1));
+  const aGroups = itemGroups(aTexts);
   const answerPages = [];
   const answerByItem = new Map();
   aGroups.forEach((group, gi) => {
@@ -1693,7 +1806,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     prog(`Reading questions…`, 0.25 + (i - 1) / nq * 0.05);
     qTexts.push(await qSrc.text(i));
   }
-  const qGroups = groupPages(qTexts.map(itemNumber)).map((g) => g.map((i) => i + 1));
+  const qGroups = itemGroups(qTexts);
 
   for (let gi = 0; gi < qGroups.length; gi++) {
     const group = qGroups[gi];
@@ -1733,40 +1846,16 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       }
     }
 
-    // choice letters A) B) ... Q) — topmost occurrence per letter in the band,
-    // and never above choice A's own line: "37.0C (98.6F)" in a vitals table
-    // hands us an "F)" token a third of a page above the real choices, and a
-    // phantom F both invents a sixth choice and puts the run out of reading
-    // order, which used to drop the whole item into image mode.
-    const letterCands = new Map();
-    for (const wd of rawWords) {
-      // the O of a choice label comes out of some text layers as a zero (the
-      // same glyph the radio circles use); every other letter reads cleanly
-      const m = wd.text.match(/^([A-Z0])\)$/);
-      if (!m) continue;
-      if (wd.y0 < top || wd.y1 > bottom) continue;
-      const L = m[1] === "0" ? "O" : m[1];
-      if (!letterCands.has(L)) letterCands.set(L, []);
-      letterCands.get(L).push(wd);
-    }
-    for (const list of letterCands.values()) list.sort((a, b) => a.y0 - b.y0);
-    const letterBoxes = new Map();
-    const aList = letterCands.get("A");
-    if (aList) {
-      // a second column's first label shares choice A's baseline, so the floor
-      // is a line's worth above it, not A's baseline exactly
-      const floor = aList[0].base - (aList[0].y1 - aList[0].y0);
-      for (const [L, list] of letterCands) {
-        const b = list.find((wd) => wd.base >= floor);
-        if (b) letterBoxes.set(L, b);
-      }
-    }
-    const ordered = [];
-    let code = 65;
-    while (letterBoxes.has(String.fromCharCode(code))) {
-      ordered.push([String.fromCharCode(code), letterBoxes.get(String.fromCharCode(code))]);
-      code++;
-    }
+    // choice letters: "A)" on the NBME client, "A." on the app the ObGyn forms
+    // come from, either of them with the radio circle fused onto the front.
+    // The second pass accepts both spellings, because the OCR repair can
+    // rewrite a dotted page's clean labels and leave the fused ones behind,
+    // and it is taken only when it finds more labels than the unambiguous
+    // bracketed pass did.
+    let ordered = choiceRun(rawWords, top, bottom, /^([A-Z0])\)$/, false);
+    const loose = choiceRun(rawWords, top, bottom,
+                            /^[O0Qo\u00a9\u00ae\u2022(\[]?([A-Z])[.)]$/, true);
+    if (loose.length > ordered.length) ordered = loose;
 
     const choices = [];
     const pxChoices = [];

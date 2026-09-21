@@ -41,6 +41,10 @@ def _norm(s: str) -> str:
     # literal spaces in the chrome pattern below.
     s = s.replace("\u00a0", " ")
     s = re.sub(r"Exam Section.*?Self-Assessment", " ", s, flags=re.S)
+    # the other share format's header: "Question 7 Of 50 (03:41)". The timer
+    # differs between a question page and its answer page, so it has to go
+    # before the two stems are compared.
+    s = re.sub(r"Question\s*\d+\s*[Oo]f\s*\d+\s*\(?[\d:]*\)?", " ", s)
     s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
     return re.sub(r"\s+", " ", s).strip()
 
@@ -60,9 +64,16 @@ def _stem_key(text: str) -> str:
     return _norm(t)[:350]
 
 
+# Two share formats, two page headers: the NBME client prints
+# "Exam Section : Item 7 of 50", the app the ObGyn forms come from prints
+# "Question 7 Of 50 (03:41)". Either one names the item the page belongs to.
+# The space can be lost by OCR ("Question 35Of Of 50"), so it is optional.
+_HEADER_ITEM = re.compile(r"(?:Item|Question)\s*(\d+)\s*[Oo]f\b")
+
+
 def _item_number(text: str, fallback: int | None) -> int | None:
     """Best-effort item number from a page (header, then body, then fallback)."""
-    m = re.search(r"Item\s+(\d+)\s+of", text)
+    m = _HEADER_ITEM.search(text)
     if m:
         return int(m.group(1))
     m = re.search(r"(?:^|\n)\s*(\d+)\s*[.)]\s+[A-Z(]", text)
@@ -162,6 +173,21 @@ def _content_band(arr: np.ndarray) -> tuple[int, int]:
             top = int(top_band.max()) + 1
         if len(bot_band):
             bottom = int(bot_band.min())
+    if top == 0 and bottom == h:
+        # No navy bars at all: the ObGyn share app draws its header and its
+        # toolbar as flat light-grey strips on a white page. The content is
+        # what is white, so walk in from each edge while the rows are not --
+        # which steps over the toolbar's coloured icons, where a rule looking
+        # for grey rows alone stops short and leaves "Define" in the stem.
+        white = ((r >= 253) & (g >= 253) & (b >= 253)).mean(axis=1)
+        y = 0
+        while y < h * 0.22 and white[y] <= 0.6:
+            y += 1
+        top = y
+        y = h - 1
+        while y > h * 0.78 and white[y] <= 0.6:
+            y -= 1
+        bottom = y + 1
     # Safety padding so nothing important is clipped.
     top = max(0, top)
     bottom = min(h, bottom)
@@ -199,6 +225,73 @@ def _choice_columns(ordered, cw: float) -> list[list[int]]:
     for m in cols:
         m.sort(key=lambda i: ordered[i][1][1])
     return cols
+
+
+# The unticked radio circle, as OCR reads it: "O", "(O", "(OO", "\u00a9", "()"...
+_LABEL_JUNK = re.compile(r"^[O0Qo\u00a9\u00ae\u2022()\[\]{}.,_|\-\u2013\u2014]{1,4}$")
+
+
+def _choice_run(words: list[dict], top: float, bottom: float,
+                pattern: str, line_initial: bool = False
+                ) -> list[tuple[str, list[float]]]:
+    """The contiguous run of choice labels A, B, C, ... on one page.
+
+    `pattern` spells a label: "A)" on the NBME client, "A." on the app the
+    ObGyn forms come from. Only the topmost occurrence of each letter counts,
+    and never one above choice A's own line -- "37.0C (98.6F)" in a vitals
+    table hands us an "F)" token a third of a page above the real choices, and
+    a phantom F both invents a sixth choice and puts the run out of reading
+    order. A second column's first label shares A's line, so a line of slack
+    is allowed.
+    """
+    rx = re.compile(pattern)
+    cands: dict[str, list[list[float]]] = {}
+    for w in words:
+        # the O of a choice label comes out of some text layers as a zero
+        # (the same glyph the radio circles use)
+        m = rx.match(w["text"])
+        if not m:
+            continue
+        # A label opens its row. Only the radio circle, when OCR read it as a
+        # token of its own, may sit to its left. Without this a choice ending
+        # in "...vitamin E." would be read as the next choice in the run --
+        # which is why the bracketed spelling, unambiguous on its own, does
+        # not ask for it (a two-column grid's right-hand labels share a row
+        # with the left's).
+        if line_initial:
+            cy = (w["y0"] + w["y1"]) / 2
+            tol = (w["y1"] - w["y0"]) * 0.5
+            left = [o for o in words if o is not w
+                    and abs((o["y0"] + o["y1"]) / 2 - cy) <= tol
+                    and o["x1"] <= w["x0"] + 2]
+            if not all(_LABEL_JUNK.match(o["text"]) for o in left):
+                continue
+        L = "O" if m.group(1) == "0" else m.group(1)
+        bx = [w["x0"], w["y0"], w["x1"], w["y1"]]
+        # an unticked radio circle read as part of the label ("OA.", "OI.")
+        # -- keep the right edge, since the circle sits in the part dropped
+        if len(w["text"]) > 2:
+            bx[0] = bx[2] - (bx[2] - bx[0]) * 2.0 / len(w["text"])
+        if bx[1] < top or bx[3] > bottom:
+            continue
+        cands.setdefault(L, []).append(bx)
+    for lst in cands.values():
+        lst.sort(key=lambda b: b[1])
+    letter_boxes = {}
+    if "A" in cands:
+        a0 = cands["A"][0]
+        floor = a0[1] - (a0[3] - a0[1])
+        for L, lst in cands.items():
+            for bx in lst:
+                if bx[1] >= floor:
+                    letter_boxes[L] = bx
+                    break
+    ordered = []
+    expect = ord("A")
+    while chr(expect) in letter_boxes:
+        ordered.append((chr(expect), letter_boxes[chr(expect)]))
+        expect += 1
+    return ordered
 
 
 def _line_groups(words: list[dict]) -> list[dict]:
@@ -318,9 +411,13 @@ class Item:
 # --------------------------------------------------------------------------- #
 
 class ExamParser:
-    def __init__(self, questions_pdf: str, answers_pdf: str, dpi: int = 132):
+    def __init__(self, questions_pdf: str, answers_pdf: str | None,
+                 dpi: int = 132):
         self.qdoc = fitz.open(questions_pdf)
-        self.adoc = fitz.open(answers_pdf)
+        # An answer key is optional: a form whose key has not been shared yet
+        # still makes a usable practice sitting, with every item flagged as
+        # having no key and left out of the score.
+        self.adoc = fitz.open(answers_pdf) if answers_pdf else None
         self.dpi = dpi
         self.zoom = dpi / 72.0
         self.items: list[Item] = []
@@ -354,10 +451,22 @@ class ExamParser:
                 for w in doc[pno].get_text("words")]
 
     def _groups(self, doc) -> list[list[int]]:
-        """Pages of the document, grouped into one group per item."""
-        return stitch.group_pages(
-            [_item_number(doc[p].get_text(), None) for p in range(len(doc))]
-        )
+        """Pages of the document, grouped into one group per item.
+
+        A page that names no item and carries next to no text is not part of
+        any item: ObGyn Form 9's export contains a 1004x30 strip (a Touch Bar
+        screenshot caught by the capture), which would otherwise become an
+        item of its own and shift every item after it by one.
+        """
+        pages, nums = [], []
+        for p in range(len(doc)):
+            t = doc[p].get_text()
+            n = _item_number(t, None)
+            if n is None and len(re.findall(r"[A-Za-z]{2,}", t)) < 10:
+                continue
+            pages.append(p)
+            nums.append(n)
+        return [[pages[i] for i in g] for g in stitch.group_pages(nums)]
 
     def _stitched(self, doc, cache: dict, group: list[int]):
         """Composite image, merged words and content band for one item.
@@ -425,6 +534,11 @@ class ExamParser:
         header item number, so the letter and the stem are taken from the
         whole group rather than from whichever shot happened to come first.
         """
+        if self.adoc is None:
+            self._a_groups = []
+            self._answer_pages = []
+            self._answer_by_item = {}
+            return
         self._a_groups = self._groups(self.adoc)
         by_item: dict[int, tuple[int, str, str]] = {}
         cands = []
@@ -489,42 +603,18 @@ class ExamParser:
         self._crop[idx] = (top, bottom)
         cw, ch = arr.shape[1], bottom - top
 
-        # locate choice letters (A) B) ... up to Z)
-        cands: dict[str, list[list[float]]] = {}
-        for w in words:
-            # the O of a choice label comes out of some text layers as a zero
-            # (the same glyph the radio circles use)
-            m = re.match(r"^([A-Z0])\)$", w["text"])
-            if not m:
-                continue
-            L = "O" if m.group(1) == "0" else m.group(1)
-            bx = [w["x0"], w["y0"], w["x1"], w["y1"]]
-            if bx[1] < top or bx[3] > bottom:
-                continue
-            cands.setdefault(L, []).append(bx)
-        for lst in cands.values():
-            lst.sort(key=lambda b: b[1])
-        # keep the topmost occurrence per letter, but never one above choice
-        # A's own line: "37.0C (98.6F)" in a vitals table hands us an "F)"
-        # token a third of a page above the real choices, and a phantom F both
-        # invents a sixth choice and puts the run out of reading order. A
-        # second column's first label shares A's line, so allow a line of slack.
-        letter_boxes = {}
-        if "A" in cands:
-            a0 = cands["A"][0]
-            floor = a0[1] - (a0[3] - a0[1])
-            for L, lst in cands.items():
-                for bx in lst:
-                    if bx[1] >= floor:
-                        letter_boxes[L] = bx
-                        break
-
-        # only keep a contiguous run A, B, C, ...
-        ordered = []
-        expect = ord("A")
-        while chr(expect) in letter_boxes:
-            ordered.append((chr(expect), letter_boxes[chr(expect)]))
-            expect += 1
+        # locate choice letters: "A)" on the NBME client, "A." on the app the
+        # ObGyn forms come from, either of them with the radio circle fused
+        # onto the front. The second pass accepts both spellings, because the
+        # OCR repair can rewrite a dotted page's clean labels and leave the
+        # fused ones behind, and it is taken only when it finds more labels
+        # than the unambiguous bracketed pass did.
+        ordered = _choice_run(words, top, bottom, r"^([A-Z0])\)$")
+        loose = _choice_run(words, top, bottom,
+                            r"^[O0Qo\u00a9\u00ae\u2022(\[]?([A-Z])[.)]$",
+                            line_initial=True)
+        if len(loose) > len(ordered):
+            ordered = loose
 
         radios = [_radio_for_letter(arr, bx) for _, bx in ordered]
         cols = _choice_columns(ordered, cw)

@@ -31,9 +31,14 @@ const REPO = path.resolve(HERE, "..", "..");
 const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const PORT = Number(process.env.HARNESS_PORT || 8765);
 
-const [qPdf, aPdf, outDir] = process.argv.slice(2);
-if (!qPdf || !aPdf || !outDir) {
-  console.error('usage: node run.mjs "<q.pdf>" "<a.pdf>" <outdir>');
+// The answer key is optional (some forms are shared without one): pass "-"
+// in its place, or leave it out and give the output directory second.
+const argv = process.argv.slice(2);
+let [qPdf, aPdf, outDir] = argv;
+if (argv.length === 2) { outDir = aPdf; aPdf = null; }
+if (aPdf === "-") aPdf = null;
+if (!qPdf || !outDir) {
+  console.error('usage: node run.mjs "<q.pdf>" ["<a.pdf>"|-] <outdir>');
   process.exit(2);
 }
 
@@ -137,7 +142,7 @@ function startServer() {
       res.writeHead(200, { "content-type": "text/html" });
       return res.end(TEST_PAGE);
     }
-    if (url === "/pdfs/q.pdf" || url === "/pdfs/a.pdf") {
+    if (url === "/pdfs/q.pdf" || (url === "/pdfs/a.pdf" && aPdf)) {
       const f = url.endsWith("q.pdf") ? qPdf : aPdf;
       res.writeHead(200, { "content-type": "application/pdf",
                            "content-length": fs.statSync(f).size });
@@ -169,6 +174,9 @@ if (reuseProfile) await fsp.mkdir(reuseProfile, { recursive: true });
 const browser = await puppeteer.launch({
   executablePath: CHROME,
   headless: "shell" in puppeteer ? true : true,
+  // an image-only PDF is OCR'd in the page; that one evaluate() call runs for
+  // minutes and the 180s default protocol timeout would kill the run
+  protocolTimeout: 0,
   userDataDir,
   args: ["--no-sandbox", "--disable-dev-shm-usage", "--allow-file-access-from-files",
          "--js-flags=--max-old-space-size=8192", "--window-size=2000,1400"],
@@ -183,14 +191,15 @@ page.on("pageerror", (e) => consoleLines.push("pageerror: " + e.message));
 await page.goto(`http://127.0.0.1:${PORT}/docs/__harness.html`, { waitUntil: "load" });
 await page.waitForFunction("window.__pdfjsReady && window.parseExam", { timeout: 30000 });
 
-console.log(`parsing\n  Q ${qPdf}\n  A ${aPdf}`);
+console.log(`parsing\n  Q ${qPdf}\n  A ${aPdf || "(none — unscored)"}`);
 const t0 = Date.now();
-const summary = await page.evaluate(async () => {
+const summary = await page.evaluate(async (hasAnswers) => {
   const prog = [];
   const onProgress = (label, frac) => { prog.push([label, frac]); };
   const t = performance.now();
   const qb = new Uint8Array(await (await fetch("/pdfs/q.pdf")).arrayBuffer());
-  const ab = new Uint8Array(await (await fetch("/pdfs/a.pdf")).arrayBuffer());
+  const ab = hasAnswers
+    ? new Uint8Array(await (await fetch("/pdfs/a.pdf")).arrayBuffer()) : null;
   const fetchMs = performance.now() - t;
   const t1 = performance.now();
   window.DATA = await window.parseExam(qb, ab, onProgress, { keepPageImages: true });
@@ -198,7 +207,7 @@ const summary = await page.evaluate(async () => {
   return { count: window.DATA.count, title: window.DATA.title,
            parseMs, fetchMs, prog, ocr: window.DATA.ocr || null,
            bandFallback: window.DATA.bandFallback || null };
-}, { timeout: 0 });
+}, Boolean(aPdf), { timeout: 0 });
 const wallMs = Date.now() - t0;
 console.log(`parsed ${summary.count} items in ${(summary.parseMs / 1000).toFixed(1)}s ` +
             `(wall ${(wallMs / 1000).toFixed(1)}s)`);
@@ -290,7 +299,7 @@ const keyed = items.filter((i) => i.answer_available).length;
 const textMode = items.filter((i) => i.mode === "text").length;
 const lines = [];
 lines.push(`Q: ${qPdf}`);
-lines.push(`A: ${aPdf}`);
+lines.push(`A: ${aPdf || "(none — unscored)"}`);
 lines.push(`title: ${summary.title}`);
 const withInfo = items.filter((i) => i.answer_info).length;
 lines.push(`items: ${items.length}   keyed: ${keyed}   text-mode: ${textMode}` +
