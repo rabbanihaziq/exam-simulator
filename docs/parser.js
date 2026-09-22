@@ -112,6 +112,30 @@ function contentBand(data, w, h) {
   const botBand = dark.filter((y) => y > h * 0.78);
   if (topBand.length) top = Math.max(...topBand) + 1;
   if (botBand.length) bottom = Math.min(...botBand);
+  else if (dark.length) {
+    // A capture pasted onto a larger sheet leaves white below it, so the
+    // footer bar stops well short of the page bottom: Surgery Form 2's sits at
+    // 0.70–0.75 of page height on every page, under the 0.78 cut, and the
+    // whole footer ("Next / Lab Values / Review / Help / Pause") was landing
+    // inside the last choice on 45 of its 48 text-mode items. Fall back to the
+    // last run of navy rows, which is the footer whatever height it sits at --
+    // but only below the middle of the page, so a dark figure in the content
+    // area is never mistaken for one.
+    // The footer is not one solid run: the seal watermark lightens its middle,
+    // so it breaks into two bands a few rows apart, and taking the last of
+    // them would cut inside the footer and leave its labels in the item. Join
+    // runs closer together than a twentieth of the page, which is far below
+    // the distance from the content to the footer.
+    const gap = Math.max(4, h * 0.05);
+    const runs = [];
+    for (const y of dark) {
+      const last = runs.length ? runs[runs.length - 1] : null;
+      if (last && y - last[1] <= gap) last[1] = y;
+      else runs.push([y, y]);
+    }
+    const foot = runs[runs.length - 1];
+    if (foot && foot[0] > h * 0.5 && foot[0] > top) bottom = foot[0];
+  }
   if (top === 0 && bottom === h) {
     // No navy bars at all: the ObGyn share app draws its header and its
     // toolbar as flat light-grey strips on a white page. The content is what
@@ -899,12 +923,22 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     // why the bracketed spelling, unambiguous on its own, does not ask for it
     // (a two-column grid's right-hand labels share a row with the left's).
     if (lineInitial) {
-      const tol = (wd.y1 - wd.y0) * 0.5;
+      const lh = wd.y1 - wd.y0;
+      const tol = lh * 0.5;
+      // Only a word butting up against this one disqualifies it. Anything
+      // further left belongs to another column: on Form 2's matching sets the
+      // gutter before the right-hand label is 1.3 to 3.8 line boxes wide,
+      // while a word space inside a choice is about a tenth of one, so the
+      // two never come close. Without this the right column is rejected
+      // outright -- item 27 stopped at I and lost options J through R.
       const left = raw.filter((o) => o !== wd && Math.abs(o.base - wd.base) <= tol &&
-                                     o.x1 <= wd.x0 + 2);
+                                     o.x1 <= wd.x0 + 2 && wd.x0 - o.x1 < lh * 0.6);
       if (!left.every((o) => LABEL_JUNK.test(o.text))) continue;
     }
-    const L = m[1] === "0" ? "O" : m[1];
+    // A label letter OCR reads as the digit it looks like. "0" for O was
+    // always here; "1" for I turns up on Form 2's 20-option matching sets,
+    // where the run has to reach R and stops dead at the missing I.
+    const L = m[1] === "0" ? "O" : m[1] === "1" ? "I" : m[1];
     // an unticked radio circle read as part of the label — keep the right
     // edge, since the circle sits in the part being dropped, and remember the
     // token itself so the choice's own text can still exclude it
@@ -926,8 +960,37 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
   }
   const ordered = [];
   let code = 65;
-  while (boxes.has(String.fromCharCode(code))) {
-    ordered.push([String.fromCharCode(code), boxes.get(String.fromCharCode(code))]);
+  for (;;) {
+    const L = String.fromCharCode(code);
+    if (boxes.has(L)) { ordered.push([L, boxes.get(L)]); code++; continue; }
+    // A single missing letter, rebuilt from the rows on either side of it.
+    // OCR drops or fuses one label often enough -- Form 2 item 27's "O)" came
+    // back as nothing at all, Form 1 item 13's "E)" as "E)5L" -- and without
+    // this the run stops at the hole and every choice below it is swallowed
+    // by the choice above. Both neighbours must be present, in the same
+    // column, and about two rows apart, so a stray "G)" further down the page
+    // can never extend a run that has genuinely ended.
+    const after = boxes.get(String.fromCharCode(code + 1));
+    const prev = ordered.length ? ordered[ordered.length - 1][1] : null;
+    if (!prev || !after) break;
+    const lh = prev.y1 - prev.y0;
+    if (Math.abs(prev.x0 - after.x0) > lh * 2) break;      // different columns
+    let pitch = lh * 2.2;
+    if (ordered.length >= 2) {
+      const d = [];
+      for (let i = 1; i < ordered.length; i++) {
+        const gap = ordered[i][1].base - ordered[i - 1][1].base;
+        if (gap > 0) d.push(gap);
+      }
+      d.sort((a, b) => a - b);
+      if (d.length) pitch = d[d.length >> 1];
+    }
+    const span = after.base - prev.base;
+    if (span < pitch * 1.4 || span > pitch * 2.8) break;
+    const mid = (a, b) => (a + b) / 2;
+    ordered.push([L, { x0: mid(prev.x0, after.x0), x1: mid(prev.x1, after.x1),
+                       y0: mid(prev.y0, after.y0), y1: mid(prev.y1, after.y1),
+                       base: mid(prev.base, after.base), filled: true }]);
     code++;
   }
   return ordered;
@@ -1165,7 +1228,9 @@ function dedupeWords(words) {
 const TESS_VERSION = "5.1.1";          // pinned: the version this was tested on
 const TESS_SRC = `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist/tesseract.min.js`;
 const OCR_DPI = 200;                   // the screenshots are ~2670px wide: about native
-const OCR_CACHE_VERSION = 1;           // bump to invalidate every cached page
+const OCR_MIN_PX = 3300;               // ...but see the scale note in ocrDocument
+const OCR_MAX_SCALE = 6;               // bound the canvas for a very small page
+const OCR_CACHE_VERSION = 2;           // bump to invalidate every cached page
 const OCR_DB = "exam-parser-ocr", OCR_STORE = "pages";
 
 /* Load tesseract.js on demand. Its worker, wasm core and language data all
@@ -1561,7 +1626,19 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
     workers.push(w);
   }
 
-  const scale = OCR_DPI / 72;
+  // How big the capture was pasted varies enormously between shares: Forms 3,
+  // 9 and 10 carry it at native size (a 2048-px image on a 2048-pt page),
+  // while Form 2's sits on an ordinary 792-pt sheet. A flat 200 dpi therefore
+  // renders Form 2's text about 15 px tall against Form 3's 53, and tesseract
+  // drops or fuses glyphs that small: Form 2 item 31 lost its "C)" label
+  // outright and item 43 came back with circle, label and choice text as one
+  // "OD)EEG" token. Either one is a hole in the A-B-C-D run, and the choice
+  // list stops dead at it. So scale a small page up until its text is a
+  // comparable size, and never render below OCR_DPI.
+  const first = await doc.getPage(todo[0]);
+  const vw = first.getViewport({ scale: 1 }).width;
+  first.cleanup();
+  const scale = Math.min(OCR_MAX_SCALE, Math.max(OCR_DPI / 72, OCR_MIN_PX / vw));
   let next = 0, done = 0;
   const say = () => onProgress(
     `This PDF has no text layer. Recognizing text in your browser ` +
@@ -1854,7 +1931,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     // bracketed pass did.
     let ordered = choiceRun(rawWords, top, bottom, /^([A-Z0])\)$/, false);
     const loose = choiceRun(rawWords, top, bottom,
-                            /^[O0Qo\u00a9\u00ae\u2022(\[]?([A-Z])[.)]$/, true);
+                            /^[O0Qo\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.)]$/, true);
     if (loose.length > ordered.length) ordered = loose;
 
     const choices = [];
@@ -1863,6 +1940,39 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     // choice's row and text band both have to stop where that stem starts.
     const stemLine = stemBelowChoices(rawWords, ordered, bottom);
     const bodyTop = stemLine ? stemLine.y0 - 2 : null;
+    // A label-shaped token sitting in the choice block that the run never
+    // claimed means the run broke at a letter OCR dropped or fused, and every
+    // choice past the hole has been swallowed by the one above it: Form 2's
+    // items 27 and 28 print a 20-option matching set in two columns and came
+    // back with 8 options, the last of them carrying the other twelve as
+    // prose. A list like that cannot be answered and, worse, does not look
+    // broken, so hand the item to image mode and show the page as it is.
+    let runBroken = false;
+    if (ordered.length) {
+      // Matched by row, not just by letter: Form 2 item 4's "E)" was read as
+      // a second "B)", so the letter looks claimed while its row is not, and
+      // the choice went on showing four options with the fifth glued to the
+      // end of D.
+      const rowOf = new Map(ordered.map(([L, bx]) => [L, bx.base]));
+      const firstY = ordered[0][1].y0;
+      const lastY = bodyTop !== null ? bodyTop : bottom;
+      runBroken = rawWords.some((wd) => {
+        if (wd.y0 < firstY || wd.y1 > lastY) return false;
+        const m = wd.text.match(/^[O0Qo©®•(\[]{0,2}([A-Z])[.)]$/);
+        if (!m) return false;
+        const base = rowOf.get(m[1]);
+        if (base !== undefined && Math.abs(base - wd.base) <= (wd.y1 - wd.y0)) return false;
+        // Only a token that opens its row can be a label. Mid-line it is
+        // ordinary prose that happens to look like one -- "Streptococcus
+        // pyogenes (group A)" on Form 4 item 44, "E. coli" on Form 5 item 9,
+        // both of which this flagged as broken runs until it asked.
+        const lh = wd.y1 - wd.y0;
+        return !rawWords.some((o) => o !== wd && Math.abs(o.base - wd.base) <= lh * 0.5 &&
+                                     o.x1 <= wd.x0 + 2 && wd.x0 - o.x1 < lh * 0.6 &&
+                                     !LABEL_JUNK.test(o.text));
+      });
+    }
+
     // Radios first: a column's right edge is the next column's leftmost radio.
     const radios = ordered.map(([, bx]) =>
       radioForLetter(img.data, w, h, [bx.x0, bx.y0, bx.x1, bx.y1]));
@@ -1923,9 +2033,11 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     // structured real-text content; image mode is the fallback
     let content = null;
     try {
-      content = await buildItemContent(rawWords, pxChoices, top, cw, ch,
-                                       canvas, img,
-                                       stemLine ? stemLine.base : null);
+      if (!runBroken) {
+        content = await buildItemContent(rawWords, pxChoices, top, cw, ch,
+                                         canvas, img,
+                                         stemLine ? stemLine.base : null);
+      }
     } catch (e) { content = null; }
 
     // keepPageImages: the test harness wants the page render even for items
@@ -2041,7 +2153,14 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
             const letters = (p.match(/[A-Za-z]/g) || []).length;
             return letters / p.length > 0.5;
           });
-        if (texts.join(" ").length >= 200) info = { paragraphs: texts };
+        // A floor, so a page that yielded only the letter and some OCR noise
+        // shows no panel at all. It used to be 200 characters, which suited
+        // NBME's own prose keys but silently dropped 28 of Form 1's 50
+        // explanations and 14 of Form 2's: those are written in bullets, and
+        // a real one can be as short as "Correct Answer: A. / SCC -> PTHrP ->
+        // hypercalcemia". Worst case at 60 is a panel holding little more than
+        // the letter, which is no worse than the empty panel it replaces.
+        if (texts.join(" ").length >= 60) info = { paragraphs: texts };
       }
     } catch (e) { info = null; }
     aInfoCache.set(it.a_group, info);

@@ -258,6 +258,16 @@ await fsp.writeFile(path.join(out, "items.json"),
                    count: summary.count, ocr: summary.ocr,
                    parse_seconds: +(summary.parseMs / 1000).toFixed(2),
                    items }, null, 1));
+// HARNESS_WORDS=31,43 dumps those items' raw word boxes, which is the only way
+// to see what OCR actually handed the choice-run matcher.
+if (process.env.HARNESS_WORDS) {
+  const want = process.env.HARNESS_WORDS.split(",").map((s) => parseInt(s, 10));
+  const dump = await page.evaluate((nums) => Object.fromEntries(
+    window.DATA.items.filter((it) => nums.includes(it.item))
+      .map((it) => [it.item, it.words.map((w) => JSON.parse(JSON.stringify(w)))])), want);
+  await fsp.writeFile(path.join(out, "words.json"), JSON.stringify(dump, null, 1));
+}
+
 await fsp.writeFile(path.join(out, "progress.txt"),
   summary.prog.map(([l, f]) => `${(f * 100).toFixed(1).padStart(5)}%  ${l}`).join("\n") + "\n");
 

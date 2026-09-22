@@ -173,6 +173,26 @@ def _content_band(arr: np.ndarray) -> tuple[int, int]:
             top = int(top_band.max()) + 1
         if len(bot_band):
             bottom = int(bot_band.min())
+        else:
+            # A capture pasted onto a larger sheet leaves white below it, so
+            # the footer bar stops well short of the page bottom: Surgery
+            # Form 2's sits at 0.70-0.75 of page height on every page, under
+            # the 0.78 cut, and the whole footer ("Next / Lab Values / Review
+            # / Help / Pause") was landing inside the last choice on 45 of its
+            # 48 text-mode items. Fall back to the last run of navy rows,
+            # which is the footer whatever height it sits at -- but only below
+            # the middle of the page, so a dark figure in the content area is
+            # never mistaken for one.
+            # The footer is not one solid run: the seal watermark lightens its
+            # middle, so it breaks into two bands a few rows apart, and taking
+            # the last of them would cut inside the footer and leave its
+            # labels in the item. Join runs closer together than a twentieth
+            # of the page, far below the content-to-footer distance.
+            gap = max(4, h * 0.05)
+            breaks = np.where(np.diff(dark_rows) > gap)[0]
+            foot_start = int(dark_rows[breaks[-1] + 1]) if len(breaks) else int(dark_rows[0])
+            if foot_start > h * 0.5 and foot_start > top:
+                bottom = foot_start
     if top == 0 and bottom == h:
         # No navy bars at all: the ObGyn share app draws its header and its
         # toolbar as flat light-grey strips on a white page. The content is
