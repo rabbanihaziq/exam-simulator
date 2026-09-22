@@ -655,13 +655,19 @@ class ExamParser:
             cx, cy, rad = radios[idx]
             members = cols[col_of[idx]]
             pos = members.index(idx)
-            nbx = ordered[members[pos + 1]][1] if pos + 1 < len(members) else None
+            nidx = members[pos + 1] if pos + 1 < len(members) else None
+            nbx = ordered[nidx][1] if nidx is not None else None
             # row vertical span: from this letter to the next one DOWN ITS OWN
             # COLUMN — with A to E left and F to J right, the next letter after
             # E is back at the top of the page and the row came out negative
             row_top = bx[1] - rad * 0.6
             if nbx is not None:
-                row_bot = nbx[1] - rad * 0.6
+                # This row's bottom IS the next row's top, so measure it with
+                # the NEXT row's radio. With its own, a row whose circle came
+                # out a pixel bigger than its neighbour's began before the row
+                # above had ended, and the overlapping band took clicks meant
+                # for the choice below it.
+                row_bot = nbx[1] - radios[nidx][2] * 0.6
             else:
                 row_bot = bx[3] + (bx[3] - bx[1]) * 1.4
             if body_top is not None:

@@ -972,9 +972,8 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     // can never extend a run that has genuinely ended.
     const after = boxes.get(String.fromCharCode(code + 1));
     const prev = ordered.length ? ordered[ordered.length - 1][1] : null;
-    if (!prev || !after) break;
+    if (!prev) break;
     const lh = prev.y1 - prev.y0;
-    if (Math.abs(prev.x0 - after.x0) > lh * 2) break;      // different columns
     let pitch = lh * 2.2;
     if (ordered.length >= 2) {
       const d = [];
@@ -985,6 +984,31 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
       d.sort((a, b) => a - b);
       if (d.length) pitch = d[d.length >> 1];
     }
+    if (!after) {
+      // Nothing follows the hole, so there is no pair to interpolate between.
+      // The letter can still be misread rather than missing: Form 2 item 4's
+      // "E)" came back as a second "B)", which leaves a label sitting exactly
+      // one row below D that belongs to no choice, and the item showed four
+      // options with the fifth glued to the end of the fourth. Claim such a
+      // token only when its own letter is already spoken for by a different
+      // row -- a genuine new letter is a new choice, not a misreading -- and
+      // when it sits one pitch below the last row, in the same column.
+      let stray = null;
+      for (const [SL, list] of cands) {
+        for (const b of list) {
+          if (b === boxes.get(SL)) continue;                 // that row's own label
+          if (!boxes.has(SL)) continue;                      // not a duplicate
+          if (Math.abs(b.x0 - prev.x0) > lh * 0.8) continue;  // another column
+          if (Math.abs(b.base - prev.base - pitch) > pitch * 0.35) continue;
+          if (!stray || b.base < stray.base) stray = b;
+        }
+      }
+      if (!stray) break;
+      ordered.push([L, { ...stray, relabelled: true }]);
+      code++;
+      continue;
+    }
+    if (Math.abs(prev.x0 - after.x0) > lh * 2) break;      // different columns
     const span = after.base - prev.base;
     if (span < pitch * 1.4 || span > pitch * 2.8) break;
     const mid = (a, b) => (a + b) / 2;
@@ -1993,7 +2017,15 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       const nx = col.members[col.members.indexOf(idx) + 1];
       const nbx = nx === undefined ? null : ordered[nx][1];
       const rowTop = bx.y0 - rad * 0.6;
-      let rowBot = nbx ? nbx.y0 - rad * 0.6 : bx.y1 + (bx.y1 - bx.y0) * 1.4;
+      // This row's bottom IS the next row's top, so it has to be measured
+      // with the next row's radio, not this one's. Measured with its own, any
+      // row whose circle came out a pixel bigger than its neighbour's began
+      // before the row above it had ended: 64 overlapping pairs on Form 2 and
+      // 104 on Form 1, where OCR sizes every circle a little differently,
+      // against none on Form 5. An overlap is a band in which a click on the
+      // option text registers as the choice above it.
+      let rowBot = nbx ? nbx.y0 - radios[nx][2] * 0.6
+                       : bx.y1 + (bx.y1 - bx.y0) * 1.4;
       if (bodyTop !== null) rowBot = Math.min(rowBot, bodyTop);
       // cx/cy/rad let extendFiguresBelow mask the radio circles, the only ink
       // below the stem that no text box covers
