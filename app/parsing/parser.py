@@ -71,7 +71,7 @@ def _stem_key(text: str) -> str:
 _HEADER_ITEM = re.compile(r"(?:Item|Question)\s*(\d+)\s*[Oo]f\b")
 
 
-_FIRST_CHOICE = re.compile(r"(?:^|\n)[^\S\n]*[^\sA-Za-z0-9]?[^\S\n]*A\s*[.)]\s")
+_FIRST_CHOICE = re.compile(r"(?:^|\n)[^\S\n]*(?:\S[^\S\n]+|[O0o(•○◯●])?A\s*[.)]\s")
 
 
 def _item_number(text: str, fallback: int | None) -> int | None:

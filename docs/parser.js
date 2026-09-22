@@ -52,8 +52,9 @@ const HEADER_ITEM = /(?:Item|Question)\s*(\d+)\s*[Oo]f\b/;
    "1)", so on Surgery Form 1 item 30 (choices A to I, no header) the line
    "1) Increase tidal volume" was taken as the item number, the page became a
    second item 1, and the two shared one saved answer. A number found at or
-   below choice A is a choice label, not the item's number. */
-const FIRST_CHOICE = /(?:^|\n)[^\S\n]*[^\sA-Za-z0-9]?[^\S\n]*A\s*[.)]\s/;
+   below choice A is a choice label, not the item's number. Choice A may
+   carry the radio circle OCR'd in front of it ("O A)", "OA)", "• A)"). */
+const FIRST_CHOICE = /(?:^|\n)[^\S\n]*(?:\S[^\S\n]+|[O0o(•○◯●])?A\s*[.)]\s/;
 
 function itemNumber(text) {
   let m = text.match(HEADER_ITEM);
