@@ -46,11 +46,23 @@ function stemKey(text) {
    The space can be lost by OCR ("Question 35Of Of 50"), so it is optional. */
 const HEADER_ITEM = /(?:Item|Question)\s*(\d+)\s*[Oo]f\b/;
 
+/* Without a header, a page may still print its number on a line of its own
+   ("27." above the NBME chrome on Surgery Form 2). That number always sits
+   above the answer choices, and it must: OCR reads a choice label "I)" as
+   "1)", so on Surgery Form 1 item 30 (choices A to I, no header) the line
+   "1) Increase tidal volume" was taken as the item number, the page became a
+   second item 1, and the two shared one saved answer. A number found at or
+   below choice A is a choice label, not the item's number. */
+const FIRST_CHOICE = /(?:^|\n)[^\S\n]*[^\sA-Za-z0-9]?[^\S\n]*A\s*[.)]\s/;
+
 function itemNumber(text) {
   let m = text.match(HEADER_ITEM);
   if (m) return parseInt(m[1], 10);
   m = text.match(/(?:^|\n)\s*(\d+)\s*[.)]\s+[A-Z(]/);
-  if (m) return parseInt(m[1], 10);
+  if (m) {
+    const c = text.match(FIRST_CHOICE);
+    if (!c || m.index < c.index) return parseInt(m[1], 10);
+  }
   return null;
 }
 
@@ -1908,6 +1920,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     qTexts.push(await qSrc.text(i));
   }
   const qGroups = itemGroups(qTexts);
+  const usedItemNos = new Set();
 
   for (let gi = 0; gi < qGroups.length; gi++) {
     const group = qGroups[gi];
@@ -1935,7 +1948,11 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     const w = st.w, h = st.h;
     const cw = st.w, ch = bottom - top;
     const itemText = group.length === 1 ? qTexts[pno - 1] : textFromWords(rawWords);
-    const itemNo = itemNumber(itemText) ?? (gi + 1);
+    let itemNo = itemNumber(itemText) ?? (gi + 1);
+    // two pages claiming one number would share a saved answer; the later
+    // claim is the suspect one, so it falls back to its position
+    if (usedItemNos.has(itemNo) && !usedItemNos.has(gi + 1)) itemNo = gi + 1;
+    usedItemNos.add(itemNo);
 
     if (pno === 1) {
       const t = qTexts[0];

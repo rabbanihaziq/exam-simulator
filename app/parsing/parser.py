@@ -71,6 +71,9 @@ def _stem_key(text: str) -> str:
 _HEADER_ITEM = re.compile(r"(?:Item|Question)\s*(\d+)\s*[Oo]f\b")
 
 
+_FIRST_CHOICE = re.compile(r"(?:^|\n)[^\S\n]*[^\sA-Za-z0-9]?[^\S\n]*A\s*[.)]\s")
+
+
 def _item_number(text: str, fallback: int | None) -> int | None:
     """Best-effort item number from a page (header, then body, then fallback)."""
     m = _HEADER_ITEM.search(text)
@@ -78,7 +81,11 @@ def _item_number(text: str, fallback: int | None) -> int | None:
         return int(m.group(1))
     m = re.search(r"(?:^|\n)\s*(\d+)\s*[.)]\s+[A-Z(]", text)
     if m:
-        return int(m.group(1))
+        # a number at or below choice A is a choice label: OCR reads "I)" as
+        # "1)" (Surgery Form 1 item 30 became a second item 1); see parser.js
+        c = _FIRST_CHOICE.search(text)
+        if c is None or m.start() < c.start():
+            return int(m.group(1))
     return fallback
 
 
@@ -703,8 +710,14 @@ class ExamParser:
         self._index_answers()
         self._q_groups = self._groups(self.qdoc)
         items = []
+        used: set[int] = set()
         for idx, group in enumerate(self._q_groups):
             it = self._parse_item(idx, group)
+            # two pages claiming one number would share a saved answer; the
+            # later claim falls back to its position
+            if it.item in used and (idx + 1) not in used:
+                it.item = idx + 1
+            used.add(it.item)
             _, _, _, text = self._stitched(self.qdoc, self._q_render, group)
             a_group, letter, conf = self._resolve_answer(it.item, _stem_key(text))
             if a_group is not None:
