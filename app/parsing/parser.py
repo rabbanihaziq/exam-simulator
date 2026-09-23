@@ -60,7 +60,7 @@ def _stem_key(text: str) -> str:
     # Drop everything up to and including the leading "N." item number.
     t = _ITEM_MARK.sub(" ", text, count=1)
     # Stop at the first answer choice or the answer-key marker.
-    t = re.split(r"\n\s*[A-Z]\)|Correct\s*Answer", t)[0]
+    t = re.split(r"\n\s*[A-Z]\)|C[oa]rrect\s*Answer", t)[0]
     return _norm(t)[:350]
 
 
@@ -144,7 +144,7 @@ def _similarity(a: str, b: str) -> float:
 # "Correct" and once by the plural "Answers" -- and must take a letter that
 # stands alone, never the initial of the next word.
 _CORRECT_ANSWER = re.compile(
-    r"(?:^|[^A-Za-z])Correct\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])"
+    r"(?:^|[^A-Za-z])C[oa]rrect\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])"
 )
 
 

@@ -36,7 +36,7 @@ function normText(s) {
 function stemKey(text) {
   // the answer key prints a red X before a wrongly answered item's number
   let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*[.)]\s/, " ");
-  t = t.split(/\n\s*[A-Z]\)|Correct\s*Answer/)[0];
+  t = t.split(/\n\s*[A-Z]\)|C[oa]rrect\s*Answer/)[0];
   return normText(t).slice(0, 350);
 }
 
@@ -75,8 +75,9 @@ function itemNumber(text) {
    "Correct" and once by the plural "Answers" — and must take a letter that
    stands alone, never the initial of the next word. Written without a
    lookbehind so older Safari still parses this file. */
+// "Carrect": OCR's reading of Surgery Form 9 item 7's key line.
 const CORRECT_ANSWER =
-  /(?:^|[^A-Za-z])Correct\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])/;
+  /(?:^|[^A-Za-z])C[oa]rrect\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])/;
 
 function correctLetter(text) {
   const m = text.match(CORRECT_ANSWER);
@@ -883,6 +884,7 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
       // lw is the label token itself; comparing text would miss the O label,
       // which some text layers spell "0)"
       if (w === pc.lw || w === pc.lw.src || w.text === pc.letter + ")") return false;
+      if (w.strike) return false;           // the strike-through button
       // a label OCR'd inside the exhibit (an "R" orientation marker on an
       // x-ray) can share a choice's baseline; it belongs to the figure
       const cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
@@ -987,15 +989,33 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     const prev = ordered.length ? ordered[ordered.length - 1][1] : null;
     if (!prev) break;
     const lh = prev.y1 - prev.y0;
+    // The row pitch, from every label found on the page and not just the run
+    // so far: with only A behind it the run has no spacing of its own, and
+    // the guess of 2.2 line boxes is too wide for Surgery Form 9's tight
+    // rows, so a hole at B (items 29, 32, 40, 41) was never filled.
     let pitch = lh * 2.2;
-    if (ordered.length >= 2) {
+    {
+      const found = [...boxes].sort((a, b) => a[0].charCodeAt(0) - b[0].charCodeAt(0));
       const d = [];
-      for (let i = 1; i < ordered.length; i++) {
-        const gap = ordered[i][1].base - ordered[i - 1][1].base;
+      for (let i = 1; i < found.length; i++) {
+        const [L0, b0] = found[i - 1], [L1, b1] = found[i];
+        if (Math.abs(b1.x0 - b0.x0) > lh * 2) continue;   // another column
+        const gap = (b1.base - b0.base) / (L1.charCodeAt(0) - L0.charCodeAt(0));
         if (gap > 0) d.push(gap);
       }
       d.sort((a, b) => a - b);
       if (d.length) pitch = d[d.length >> 1];
+    }
+    if (after && Math.abs(prev.x0 - after.x0) <= lh * 2) {   // same column
+      const span = after.base - prev.base;
+      if (span >= pitch * 1.4 && span <= pitch * 2.8) {
+        const mid = (a, b) => (a + b) / 2;
+        ordered.push([L, { x0: mid(prev.x0, after.x0), x1: mid(prev.x1, after.x1),
+                           y0: mid(prev.y0, after.y0), y1: mid(prev.y1, after.y1),
+                           base: mid(prev.base, after.base), filled: true }]);
+        code++;
+        continue;
+      }
     }
     if (!after) {
       // Nothing follows the hole, so there is no pair to interpolate between.
@@ -1016,21 +1036,127 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
           if (!stray || b.base < stray.base) stray = b;
         }
       }
-      if (!stray) break;
-      ordered.push([L, { ...stray, relabelled: true }]);
-      code++;
-      continue;
+      if (stray) {
+        ordered.push([L, { ...stray, relabelled: true }]);
+        code++;
+        continue;
+      }
     }
-    if (Math.abs(prev.x0 - after.x0) > lh * 2) break;      // different columns
-    const span = after.base - prev.base;
-    if (span < pitch * 1.4 || span > pitch * 2.8) break;
-    const mid = (a, b) => (a + b) / 2;
-    ordered.push([L, { x0: mid(prev.x0, after.x0), x1: mid(prev.x1, after.x1),
-                       y0: mid(prev.y0, after.y0), y1: mid(prev.y1, after.y1),
-                       base: mid(prev.base, after.base), filled: true }]);
+    // The label is gone altogether but its choice text is not. Surgery Form 9
+    // prints small "A." labels hard against the radio circle, and OCR drops
+    // whole labels on its rows ("Colonic injury" with nothing in front of it,
+    // C and D both missing on items 2 and 5), two in a row or at the end of
+    // the list, where neither repair above can reach. The row is rebuilt from
+    // a line that opens exactly where the other choices' text opens, one row
+    // pitch below the last choice: a wrapped continuation of that choice opens
+    // there too, but sits about half a pitch under the line above it, so the
+    // gap to the nearest line above is what tells the two apart.
+    const orphan = boxes.size >= 2 && orphanRow(raw, [...boxes], prev, pitch, bottom);
+    if (!orphan) break;
+    ordered.push([L, { x0: prev.x0, x1: prev.x1,
+                       y0: orphan.base - (prev.base - prev.y0),
+                       y1: orphan.base + (prev.y1 - prev.base),
+                       base: orphan.base, filled: true }]);
     code++;
   }
   return ordered;
+}
+
+/* The first word of a choice whose label OCR lost: it opens where the other
+   choices' text opens, one row pitch (give or take) below the last choice,
+   and the line above it is a whole row away, not a wrapped line's spacing. */
+function orphanRow(raw, ordered, prev, pitch, bottom) {
+  const lh = prev.y1 - prev.y0;
+  // Only where rows are spaced wider than wrapped lines. Surgery Form 2 sets
+  // its choices a single line apart, so E's wrapped second line ("proceed
+  // with the operation", item 21) is a row pitch below E and was read as F.
+  if (pitch < lh * 1.4) return null;
+  const starts = [];
+  for (const [, bx] of ordered) {
+    const tol = (bx.y1 - bx.y0) * 0.5;
+    const right = raw.filter((o) => Math.abs(o.base - bx.base) <= tol &&
+                                    o.x0 >= bx.x1 - 1 && /[A-Za-z0-9]/.test(o.text));
+    if (right.length) starts.push(Math.min(...right.map((o) => o.x0)));
+  }
+  if (starts.length < 2) return null;
+  starts.sort((a, b) => a - b);
+  const textX = starts[starts.length >> 1];
+  const labelX = Math.min(...ordered.map(([, bx]) => bx.x0));
+  const cands = raw.filter((o) => Math.abs(o.x0 - textX) <= lh * 0.5 &&
+                                  o.y1 <= bottom && /[A-Za-z0-9]/.test(o.text) &&
+                                  o.base - prev.base >= pitch * 0.8 &&
+                                  o.base - prev.base <= pitch * 1.8)
+                  .sort((a, b) => a.base - b.base);
+  for (const c of cands) {
+    const tol = (c.y1 - c.y0) * 0.5;
+    // nothing but radio-circle junk between the label column and this word
+    const left = raw.filter((o) => o !== c && Math.abs(o.base - c.base) <= tol &&
+                                   o.x1 <= c.x0 + 2 && o.x0 >= labelX - lh * 2);
+    if (!left.every((o) => LABEL_JUNK.test(o.text))) continue;
+    // the nearest line above, anywhere in the choice's text band
+    const above = raw.filter((o) => o.base < c.base - tol && o.base > prev.base - tol &&
+                                    o.x0 >= textX - lh * 0.5)
+                     .map((o) => o.base);
+    const gap = c.base - Math.max(prev.base, ...above);
+    if (gap < pitch * 0.8) continue;
+    return c;
+  }
+  return null;
+}
+
+/* Two things OCR does to the choice list on Surgery Form 9's client. It reads
+   the strike-through button at the right end of every row ("ab" drawn struck
+   through) as a word -- "ab", "kr", "te", "=k", "25" -- which then ends every
+   choice's text; those tokens are short, have nothing after them on their
+   line and sit far from the text before them, so they are kept out of the
+   choice text (only there: the flag is read by nothing else). And it fuses a label to its choice's first word ("OB.S1-82" for
+   "B. S1-S2"), so the label is never seen; that token is split in two. */
+function tidyChoiceWords(raw) {
+  const out = [];
+  for (const wd of raw) {
+    const m = wd.text.match(/^([O0QoCJ©®•(\[]{1,2}[A-Z][.)])([A-Za-z0-9].+)$/);
+    if (!m) { out.push(wd); continue; }
+    const cut = wd.x0 + (wd.x1 - wd.x0) * m[1].length / wd.text.length;
+    out.push({ ...wd, x1: cut, text: m[1] });
+    out.push({ ...wd, x0: cut + 1, text: m[2] });
+  }
+  const labelish = (o) => LABEL_JUNK.test(o.text) ||
+    /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}[A-Z][.,)]$/.test(o.text);
+  // Short, last on its line, and behind some real choice text: a one-word
+  // choice ("ECG") has only its label to its left and is never a candidate.
+  const cands = [];
+  for (const wd of out) {
+    if (wd.text.length > 3) continue;
+    const lh = wd.y1 - wd.y0;
+    const line = out.filter((o) => o !== wd && Math.abs(o.base - wd.base) <= lh * 0.5);
+    if (line.some((o) => o.x0 > wd.x0)) continue;
+    const left = line.filter((o) => o.x1 <= wd.x0 + 2).sort((a, b) => a.x0 - b.x0);
+    if (!left.some((o) => !labelish(o))) continue;
+    cands.push({ wd, lh, left });
+  }
+  const drop = new Set();
+  for (const { wd, lh, left } of cands) {
+    // Either it lines up with the same button on other rows -- the box is as
+    // wide as its longest choice, so on a list of short choices the button
+    // sits right after the text --
+    const peers = cands.filter((c) => c.wd !== wd && Math.abs(c.wd.x0 - wd.x0) <= lh * 0.6 &&
+                                      Math.abs(c.wd.base - wd.base) > lh);
+    if (peers.length >= 2) { drop.add(wd); continue; }
+    // -- or, when OCR saw the button on only one row, it sits well clear of
+    // the prose before it. A choice laid out as a table row ("7.30  50  24")
+    // has wide gaps of its own, and its last cell is data, not the button.
+    if (wd.x0 - left[left.length - 1].x1 < lh * 3) continue;
+    let gapped = false;
+    for (let i = 2; i < left.length; i++) {
+      if (left[i].x0 - left[i - 1].x1 > lh * 2) gapped = true;
+    }
+    if (!gapped) drop.add(wd);
+  }
+  // Flagged, not removed: the glyph's ink has to stay covered by a word box,
+  // or figure detection takes it for an exhibit and swallows the stem.
+  const res = out.map((wd) => drop.has(wd) ? { ...wd, strike: true } : wd);
+  res.itemRects = raw.itemRects;   // the text boxes figure detection masks
+  return res;
 }
 
 /* Consecutive pages sharing one header item number become one group. */
@@ -1873,6 +1999,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   const aGroups = itemGroups(aTexts);
   const answerPages = [];
   const answerByItem = new Map();
+  const groupLetter = new Map();
   aGroups.forEach((group, gi) => {
     for (const pno of group) {
       const text = aTexts[pno - 1];
@@ -1880,13 +2007,14 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       if (!letter) continue;   // continuation shot with no answer marker
       const cand = { group: gi, num: itemNumber(text), letter, key: stemKey(text) };
       answerPages.push(cand);
+      if (!groupLetter.has(gi)) groupLetter.set(gi, letter);
       if (cand.num !== null && !answerByItem.has(cand.num)) {
         answerByItem.set(cand.num, cand);
       }
     }
   });
 
-  function resolveAnswer(itemNo, qStem) {
+  function resolveAnswer(itemNo, qStem, gi, nq) {
     let bestGroup = null, bestLetter = null, bestRatio = 0;
     const cand = answerByItem.get(itemNo);
     if (cand) {
@@ -1906,6 +2034,13 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       // while its printed item number is unambiguous. Only an item the key
       // never mentions stays unmatched.
       if (cand) return [cand.group, cand.letter];
+      // Last resort, by position, when both files hold the same number of
+      // items and so line up one to one. Surgery Form 9's key pages carry no
+      // item number and some stems do not survive OCR well enough to match:
+      // yellow highlighting over the vignette (item 7), or an image viewer's
+      // "Invert / Contrast / Zoom" chrome in front of it (items 12, 18), and
+      // four items came out unkeyed while the key sat on the facing page.
+      if (aGroups.length === nq && groupLetter.has(gi)) return [gi, groupLetter.get(gi)];
       return [null, null];
     }
     return [bestGroup, bestLetter];
@@ -1944,7 +2079,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
                    words: await qSrc.words(p, viewport) });
     }
     const st = stitchShots(shots);
-    const canvas = st.canvas, img = st.img, rawWords = st.words;
+    const canvas = st.canvas, img = st.img, rawWords = tidyChoiceWords(st.words);
     const top = st.top, bottom = st.bottom;
     const w = st.w, h = st.h;
     const cw = st.w, ch = bottom - top;
@@ -1973,7 +2108,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     // bracketed pass did.
     let ordered = choiceRun(rawWords, top, bottom, /^([A-Z0])\)$/, false);
     const loose = choiceRun(rawWords, top, bottom,
-                            /^[O0Qo\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.)]$/, true);
+                            /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.,)]$/, true);
     if (loose.length > ordered.length) ordered = loose;
 
     const choices = [];
@@ -2078,7 +2213,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
 
     // resolve against the answer key
     const qStem = stemKey(itemText);
-    const [aGroup, letter] = resolveAnswer(itemNo, qStem);
+    const [aGroup, letter] = resolveAnswer(itemNo, qStem, gi, qGroups.length);
 
     // structured real-text content; image mode is the fallback
     let content = null;
