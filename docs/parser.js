@@ -967,7 +967,7 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
   const boxes = new Map();
   const aList = cands.get("A");
   if (aList) {
-    const floor = aList[0].base - (aList[0].y1 - aList[0].y0);
+    const floor = runStart(aList, cands).base - (aList[0].y1 - aList[0].y0);
     for (const [L, list] of cands) {
       const b = list.find((wd) => wd.base >= floor);
       if (b) boxes.set(L, b);
@@ -1060,6 +1060,23 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     code++;
   }
   return ordered;
+}
+
+/* Which "A" opens the item's own choice list. Normally the only one. But the
+   page of a sequential set's second member shows the first member above it,
+   answered and greyed out, choices and all ("44. Item 1 of 2 ... A) Exercise
+   stress test ... 45. Item 2 of 2 ... A) Blood pressure"), and the topmost A
+   handed item 45 the choices of item 44. The list being answered is the
+   last one on the page, so take the lowest A that a B follows in its own
+   column -- a stray "A)" with no list behind it cannot move the run. */
+function runStart(aList, cands) {
+  const bList = cands.get("B") || [];
+  for (let i = aList.length - 1; i > 0; i--) {
+    const a = aList[i], lh = a.y1 - a.y0;
+    if (bList.some((b) => b.base > a.base && b.base - a.base < lh * 4 &&
+                          Math.abs(b.x0 - a.x0) <= lh * 2)) return a;
+  }
+  return aList[0];
 }
 
 /* The first word of a choice whose label OCR lost: it opens where the other
