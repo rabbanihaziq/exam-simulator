@@ -1172,8 +1172,14 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
       const kept = [];
       for (const l of cLines) {
         if (l.base - last > lh * 3) break;
-        if (raw.some((w) => Math.abs(w.base - l.base) <= lh * 0.5 &&
-                            w.x0 < labelLeft - lh * 0.5 && /[A-Za-z]{2,}/.test(w.text))) break;
+        // The label's own line is the choice's, whatever OCR made of the
+        // radio circle in front of it: the "Question N Of 50" app's hollow
+        // circle reads "(OO" (OBGYN 9 and 10), and every last choice was cut
+        // to nothing. Below it, the radio's junk is not a word either.
+        if (Math.abs(l.base - pc.base) > lh * 0.5 &&
+            raw.some((w) => Math.abs(w.base - l.base) <= lh * 0.5 &&
+                            w.x0 < labelLeft - lh * 0.5 && /[A-Za-z]{2,}/.test(w.text) &&
+                            !LABEL_JUNK.test(w.text))) break;
         kept.push(l);
         last = l.base;
       }
