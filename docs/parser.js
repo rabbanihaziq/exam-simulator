@@ -3691,15 +3691,29 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   const writtenExpl = new Map();          // item index -> review panel
 
   function resolveAnswer(itemNo, qStem, gi, nq) {
-    let bestGroup = null, bestLetter = null, bestRatio = 0;
+    let bestGroup = null, bestLetter = null, bestRatio = 0, bestScore = 0;
     const cand = answerByItem.get(itemNo);
     if (cand) {
       bestGroup = cand.group; bestLetter = cand.letter;
-      bestRatio = similarity(qStem, cand.key);
+      // every lettered shot of that item counts, not just its first
+      for (const p of answerPages) {
+        if (p.group === cand.group && p.num === itemNo) {
+          bestRatio = Math.max(bestRatio, similarity(qStem, p.key));
+        }
+      }
+      bestScore = bestRatio;
     }
+    // A page that prints another item's number has to beat the numbered
+    // match clearly, not by a whisker: on a capture whose stems OCR mixes
+    // with browser chrome (the URL bar, "Exam Section Item 32 of 50") every
+    // page looks about 0.7 like every other, and Family Medicine 5 item 43
+    // took item 32's key over its own (0.768 against 0.754).
     for (const p of answerPages) {
       const r = similarity(qStem, p.key);
-      if (r > bestRatio) { bestGroup = p.group; bestLetter = p.letter; bestRatio = r; }
+      const score = cand && p.num !== null && p.num !== itemNo ? r - 0.1 : r;
+      if (score > bestScore) {
+        bestGroup = p.group; bestLetter = p.letter; bestRatio = r; bestScore = score;
+      }
     }
     // Dice bigrams need a higher bar than difflib's 0.55: true matches are
     // near-identical text (~0.9), while different stems that share medical
