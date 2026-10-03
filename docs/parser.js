@@ -34,8 +34,12 @@ function normText(s) {
 }
 
 function stemKey(text) {
-  // the answer key prints a red X before a wrongly answered item's number
-  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*[.)]\s/, " ");
+  // the answer key prints a red X before a wrongly answered item's number.
+  // A number closed by ")" must have text after it on its line: on its own
+  // it is the tail of a wrapped range ("(N=160-" / "950)" on Internal
+  // Medicine 9 item 27), and cutting there threw the vignette away, so the
+  // item no longer matched its answer page.
+  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*(?:\.\s|\)[^\S\n]+(?=\S))/, " ");
   t = t.split(/\n\s*[A-Z]\)|C[oa]rrect\s*Answer/)[0];
   return normText(t).slice(0, 350);
 }
