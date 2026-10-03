@@ -2185,6 +2185,204 @@ function writtenInfo(k, letter) {
   return { paragraphs: [`Correct Answer: ${letter}.`].concat(paras) };
 }
 
+/* ---------------- annotated screenshot keys ----------------------------- */
+
+/* Psychiatry Form 1's key is a student's study document rather than NBME's
+   answer pages: each item is a small screenshot of the question, then a line
+   such as ". Right answer is F" or ". Answer is C; Lithium", then notes and
+   more screenshots, with a row of "=====" between items. Items it does not
+   cover are simply absent. The letter is in the text layer, but the item it
+   belongs to is printed only inside the question screenshot ("Item 3 of 50"
+   in its header, "3. A 37-year-old..." where the stem opens), so the
+   screenshots just above each answer line are read with OCR -- the top of
+   each one only, and only until one names its item. */
+const ANNOT_ANSWER = new RegExp(
+  "(?:^|[^A-Za-z])(?:(?:[Rr]ight|[Cc]orrect)\\s+)?[Aa]nswer\\s+is\\s*:?\\s*" +
+  // a capital that stands alone, or a lower-case one only before punctuation
+  // ("Right answer is c .."): "the answer is a beta-blocker" names no choice
+  "(?:([A-Z])(?![A-Za-z])|([a-z])(?=\\s*[.;,)]))" +
+  // "answer is c or H" is not an answer
+  "(?!\\s*(?:or|/|&|and)\\s*[A-Za-z](?![A-Za-z]))");
+const ANNOT_CHOICE = /\b[Cc]hoice\s+([A-Z])\s+is\s+the\s+(?:right|correct)\s+answer/;
+const ANNOT_RULE = /^\s*[=_]{8,}\s*$/;
+
+function annotatedLetter(text) {
+  let m = text.match(ANNOT_ANSWER);
+  if (m) return (m[1] || m[2]).toUpperCase();
+  m = text.match(ANNOT_CHOICE);
+  return m ? m[1] : null;
+}
+
+/* Where a page paints its images, in PDF user space ([x0, y0, x1, y1], y up,
+   the same space getPageLines' baselines are in), from the operator list. */
+async function pageImageRects(page) {
+  const OPS = window.pdfjsLib.OPS, U = window.pdfjsLib.Util;
+  const ops = await page.getOperatorList({ intent: "print" });
+  const rects = [], stack = [];
+  let ctm = [1, 0, 0, 1, 0, 0];
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i], args = ops.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+    else if (fn === OPS.transform) ctm = U.transform(ctm, args);
+    else if (fn === OPS.paintFormXObjectBegin) {
+      stack.push(ctm);
+      if (args && Array.isArray(args[0]) && args[0].length === 6) ctm = U.transform(ctm, args[0]);
+    } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map((p) => U.applyTransform(p, ctm));
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      rects.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+    }
+  }
+  return rects;
+}
+
+/* The item a question screenshot shows: its header's "Item N of M", else
+   the number its stem opens with. Both, when read, must agree. */
+function shotItemNumber(text) {
+  const h = text.match(HEADER_ITEM);
+  const s = text.match(/(?:^|\n)[^\S\n]*(\d{1,3})\s*[.,][^\S\n]+[A-Z]/);
+  const hn = h ? parseInt(h[1], 10) : null, sn = s ? parseInt(s[1], 10) : null;
+  if (hn !== null && sn !== null && hn !== sn) return null;
+  const n = hn ?? sn;
+  return n !== null && n >= 1 && n <= 200 ? n : null;
+}
+
+/* Returns the same map readWrittenKey does (item -> { letter, answer, body,
+   page, src }), or null when the document is not this kind of key, or OCR
+   cannot be had. */
+async function readAnnotatedKey(doc, src, hash, onProgress, nItems) {
+  const stream = [];
+  let answers = 0;
+  for (let p = 1; p <= doc.numPages; p++) {
+    for (const l of await src.lines(p)) {
+      const letter = annotatedLetter(l.text);
+      if (letter) answers++;
+      stream.push({ p, y: l.y, text: l.text.trim(),
+                    kind: letter ? "ans" : ANNOT_RULE.test(l.text) ? "rule" : "text",
+                    letter });
+    }
+  }
+  if (answers < Math.max(5, nItems * 0.3)) return null;
+  // A letter drawn over the stated one is the author's correction, and the
+  // one the reader sees: Psychiatry 1 item 28 reads "Right answer is F." in
+  // the text, with a "B" annotation laid on top of the F.
+  for (let p = 1; p <= doc.numPages; p++) {
+    const mine = stream.filter((e) => e.p === p && e.kind === "ans");
+    if (!mine.length) continue;
+    const page = await doc.getPage(p);
+    const vp = page.getViewport({ scale: 1 });
+    const words = await src.words(p, vp);
+    for (const e of mine) {
+      const base = vp.height - e.y;
+      const near = words.filter((w) => Math.abs(w.base - base) <= (w.y1 - w.y0) * 0.6);
+      const said = near.find((w) => new RegExp(`^${e.letter}[.;,]?$`, "i").test(w.text));
+      if (!said) continue;
+      const over = near.find((w) => w !== said && /^[A-Z]$/.test(w.text) &&
+        Math.min(w.x1, said.x1) - Math.max(w.x0, said.x0) > 0.4 * Math.min(w.x1 - w.x0, said.x1 - said.x0));
+      if (over) { e.letter = over.text; e.text += `  [${over.text} written over it]`; }
+    }
+    page.cleanup();
+  }
+  const imgs = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    (await pageImageRects(page)).forEach((r, k) => {
+      // icons and rules are not screenshots of a question
+      if (r[2] - r[0] < 150 || r[3] - r[1] < 30) return;
+      imgs.push({ p, k, y: r[1], rect: r, kind: "img" });
+    });
+    page.cleanup();
+  }
+  // reading order: page, then top to bottom (an image sorts by its bottom
+  // edge, since the answer line sits under it)
+  const ev = stream.concat(imgs).sort((a, b) => a.p - b.p || b.y - a.y);
+
+  const Tesseract = await loadTesseract();
+  const worker = await Tesseract.createWorker("eng", 1, {
+    workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist/worker.min.js`,
+    corePath: `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESS_VERSION}`,
+  });
+  const db = hash ? await idbOpen() : null;
+  const seen = new Map();
+  async function shotNumber(im) {
+    const id = `${im.p}:${im.k}`;
+    if (seen.has(id)) return seen.get(id);
+    const ck = `${hash}:${OCR_CACHE_VERSION}:shot:${id}`;
+    let rec = db ? await idbGet(db, ck) : null;
+    if (!rec || rec.v !== OCR_CACHE_VERSION) {
+      const [x0, , x1] = im.rect;
+      const scale = Math.min(6, Math.max(2, 1600 / (x1 - x0)));
+      const page = await doc.getPage(im.p);
+      const vp = page.getViewport({ scale });
+      const [cx0, cy0, cx1, cy1] = vp.convertToViewportRectangle(im.rect);
+      const L = Math.min(cx0, cx1), T = Math.min(cy0, cy1);
+      const W = Math.abs(cx1 - cx0), H = Math.min(Math.abs(cy1 - cy0), W * 0.25);
+      const full = await renderForOcr(doc, im.p, scale);
+      const texts = [];
+      for (const invert of [false, true]) {
+        const c = document.createElement("canvas");
+        c.width = Math.round(W); c.height = Math.round(H);
+        const ctx = c.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(full, L, T, W, H, 0, 0, c.width, c.height);
+        if (invert) {
+          const d = ctx.getImageData(0, 0, c.width, c.height);
+          for (let i = 0; i < d.data.length; i += 4) {
+            d.data[i] = d.data[i + 1] = d.data[i + 2] = 255 - d.data[i];
+          }
+          ctx.putImageData(d, 0, 0);
+        }
+        const { data } = await worker.recognize(c);
+        texts.push(data.text);
+        c.width = c.height = 1;
+        // the dark header strip is read inverted; stop once a number is found
+        if (shotItemNumber(texts.join("\n")) !== null) break;
+      }
+      full.width = full.height = 1;
+      page.cleanup();
+      rec = { v: OCR_CACHE_VERSION, text: texts.join("\n") };
+      if (db) await idbPut(db, ck, rec);
+    }
+    const n = shotItemNumber(rec.text);
+    seen.set(id, n);
+    return n;
+  }
+
+  const key = new Map(), clash = new Set();
+  const ansIdx = ev.map((e, i) => (e.kind === "ans" ? i : -1)).filter((i) => i >= 0);
+  try {
+    for (let a = 0; a < ansIdx.length; a++) {
+      const i = ansIdx[a];
+      onProgress(`Reading the answer key's screenshots (${a + 1} of ${ansIdx.length})…`);
+      let num = null;
+      // the question screenshot above this answer line: nearest first, never
+      // past the previous answer line or a "=====" rule
+      for (let j = i - 1; j >= 0 && num === null; j--) {
+        if (ev[j].kind === "ans" || ev[j].kind === "rule") break;
+        if (ev[j].kind === "img") num = await shotNumber(ev[j]);
+      }
+      if (num === null) continue;
+      const e = ev[i];
+      if (key.has(num)) {
+        if (key.get(num).letter !== e.letter) clash.add(num);
+        continue;
+      }
+      const body = [e.text];
+      for (let j = i + 1; j < ev.length && ev[j].kind !== "ans" && ev[j].kind !== "rule"; j++) {
+        if (ev[j].kind === "text" && ev[j].text) body.push(ev[j].text);
+      }
+      key.set(num, { num, letter: e.letter, answer: "", body, page: e.p,
+                     src: e.text.slice(0, 160) });
+    }
+  } finally {
+    await worker.terminate().catch(() => {});
+  }
+  // two answer lines that name different letters for one item: neither
+  clash.forEach((n) => key.delete(n));
+  return key;
+}
+
 /* ---------------- main ------------------------------------------------- */
 
 async function parseExam(qBytes, aBytes, onProgress, opts) {
@@ -2310,6 +2508,13 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     for (let i = 1; i <= na; i++) pl.push(await aSrc.lines(i));
     const wk = readWrittenKey(pl);
     if (wk.size >= Math.max(5, nq * 0.3, answerPages.length * 2)) written = wk;
+    // ...or a study document of annotated question screenshots
+    if (!written) {
+      try {
+        const ak = await readAnnotatedKey(adoc, aSrc, aHash, (l) => prog(l, 0.25), nq);
+        if (ak && ak.size >= Math.max(5, nq * 0.3, answerPages.length * 2)) written = ak;
+      } catch (e) { /* no OCR engine: the form stays unscored, as before */ }
+    }
   }
   // ...or the review screen that marks the answer by highlighting its choice
   if (adoc && !written && answerPages.length < Math.max(3, nq * 0.2)) {
