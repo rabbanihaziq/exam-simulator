@@ -38,6 +38,448 @@ function loadState() {
 }
 
 /* ------------------------------------------------------------------ */
+/* item identity, user fixes, and the checks run before the clock      */
+/* ------------------------------------------------------------------ */
+/* Parsing can fail in ways only the user can see: a choice list that wasn't
+   read, a key letter the OCR lost, two pages claiming one item number. None
+   of that may stop the exam. Every item keeps a row of letter buttons, the
+   check screen shows each suspect item beside its page with one-click
+   fixes, and the fixes are saved per PDF (sa_fix_<fingerprint>, the same
+   fingerprint sa_exam_ uses) and re-applied whenever that PDF is loaded. */
+const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+let FIX = { v: 1, items: {} };   // item -> { key, nchoices, image, removed, ignored }
+let FIXKEY = null;
+
+function loadFixes() {
+  FIXKEY = "sa_fix_" + DATA.sid;
+  FIX = { v: 1, items: {} };
+  try {
+    const f = JSON.parse(localStorage.getItem(FIXKEY));
+    if (f && f.items && typeof f.items === "object") FIX = f;
+  } catch (e) {}
+}
+function saveFixes() {
+  try {
+    if (Object.keys(FIX.items).length) localStorage.setItem(FIXKEY, JSON.stringify(FIX));
+    else localStorage.removeItem(FIXKEY);
+  } catch (e) {}
+}
+function fixFor(it) { return FIX.items[it.item] || {}; }
+function hasFix(f) { return !!(f.key || f.nchoices || f.image || f.removed || f.ignored); }
+function setFix(it, patch) {
+  const f = Object.assign({}, FIX.items[it.item] || {}, patch);
+  Object.keys(f).forEach((k) => {
+    if (f[k] === null || f[k] === false || f[k] === undefined || f[k] === "") delete f[k];
+  });
+  if (hasFix(f)) FIX.items[it.item] = f;
+  else delete FIX.items[it.item];
+  saveFixes();
+  applyFixes();
+}
+
+/* Once per parse: item identity, and a snapshot of what the parser read so
+   fixes can always be undone. Item numbers come from page order whenever
+   the headers repeat or skip a number, so two items never share a slot in
+   the saved answers. */
+function prepareData(data) {
+  DATA = data;
+  if (!data._prepared) {
+    data._prepared = true;
+    if (data.hasKeyPdf === undefined) {
+      data.hasKeyPdf = data.items.some((it) => it.answer_available);
+    }
+    const seen = new Map();
+    data.items.forEach((it) => seen.set(it.item, (seen.get(it.item) || 0) + 1));
+    const n = data.items.length;
+    const clean = seen.size === n &&
+      data.items.every((it) => Number.isInteger(it.item) && it.item >= 1 && it.item <= n);
+    data.renumbered = !clean;
+    data.items.forEach((it, i) => {
+      it.page_item = it.item;
+      it.dup_number = seen.get(it.item) > 1;
+      if (!clean) it.item = i + 1;
+      it._orig = { correct: it.correct, answer_available: it.answer_available,
+                   content: it.content };
+    });
+  }
+  loadFixes();
+  applyFixes();
+}
+
+/* The parse with the user's fixes laid over it. */
+function applyFixes() {
+  DATA.items.forEach((it, i) => {
+    const o = it._orig, f = fixFor(it);
+    it.correct = f.key || o.correct;
+    it.answer_available = !!(f.key || o.answer_available);
+    it.removed = !!f.removed;
+    let content = o.content;
+    if (content) {
+      const n = content.choices.length;
+      // no choices read, or a choice count the user says is different: the
+      // text rendering would hide options, so show the page itself
+      if (f.image || !n || (f.nchoices && f.nchoices !== n)) content = null;
+    }
+    if (!content && !DATA.qURLs[i]) content = o.content;   // nothing to fall back to
+    it.content = content;
+  });
+}
+
+/* Letters the parser found on the page, in page order. */
+function detectedLetters(it) {
+  const o = it._orig || it;
+  const cs = o.content && o.content.choices.length ? o.content.choices : it.choices;
+  return (cs || []).map((c) => c.letter);
+}
+/* How many answer letters the item offers: the user's count, else up to the
+   last letter read, else 0 (unknown; the letter row then offers A to E). */
+function choiceCount(it) {
+  const f = fixFor(it);
+  if (f.nchoices) return f.nchoices;
+  const idx = detectedLetters(it).map((L) => LETTERS.indexOf(L)).filter((k) => k >= 0);
+  return idx.length ? Math.max(...idx) + 1 : 0;
+}
+function lettersFor(it) {
+  return LETTERS.slice(0, choiceCount(it) || 5).split("");
+}
+
+/* What the answer key's own words say about an item. "REMOVED" is matched
+   only in capitals or as "removed question": in lower case it is ordinary
+   prose in a dozen explanations ("the catheter was removed"). "not sure" is
+   an annotator's note unless a verb comes before it ("he is not sure if"),
+   which is a patient in a vignette. */
+function keyTextNote(t) {
+  if (!t) return null;
+  let m = t.match(/\bREMOVED\b/) ||
+    t.match(/\b(?:removed|deleted)\s+(?:question|item)\b|\b(?:question|item)\s+(?:was\s+|has\s+been\s+)?(?:removed|deleted)\b/i);
+  let kind = m ? "removed" : null;
+  if (!m) {
+    m = t.match(/(?<!\b(?:is|am|are|was|were|be|been|i'm|im)\s+)\bnot\s+sure\b/i);
+    if (m) kind = "not sure";
+  }
+  if (!m) return null;
+  const a = Math.max(0, m.index - 40), b = Math.min(t.length, m.index + m[0].length + 60);
+  return { kind, snippet: (a ? "…" : "") + t.slice(a, b).trim() + (b < t.length ? "…" : "") };
+}
+async function scanKeyText(onProgress) {
+  if (!DATA.answerInfo) return;
+  for (let i = 0; i < DATA.items.length; i++) {
+    const it = DATA.items[i];
+    if (!it._orig.answer_available) continue;
+    if (onProgress) onProgress(i / DATA.items.length);
+    try {
+      const info = await DATA.answerInfo(i);
+      it.key_note = keyTextNote(info && info.paragraphs ? info.paragraphs.join(" ") : "");
+    } catch (e) {}
+  }
+}
+
+function contentStem(content) {
+  return content.blocks.filter((b) => b.t === "p").map((b) => runsText(b.runs)).join(" ").trim();
+}
+/* The same geometry select.mjs asserts: a row with no area, a row holding
+   another choice's radio, or two rows in one column overlapping all make a
+   click on the page image land on the wrong letter. */
+function rowsOverlap(it) {
+  const cs = it.choices || [];
+  for (const a of cs) {
+    if (a.row[2] <= a.row[0] || a.row[3] <= a.row[1]) return true;
+    for (const b of cs) {
+      if (a === b) continue;
+      if (b.radio[0] >= a.row[0] && b.radio[0] <= a.row[2] &&
+          b.radio[1] >= a.row[1] && b.radio[1] <= a.row[3]) return true;
+      if (Math.abs(a.row[0] - b.row[0]) <= 0.02 &&
+          Math.min(a.row[3], b.row[3]) - Math.max(a.row[1], b.row[1]) > 1e-4) return true;
+    }
+  }
+  return false;
+}
+
+/* Every check for one item, on the parse as fixed. A flag is "resolved" when
+   the user marked the item removed or said to ignore it. */
+function itemChecks(it) {
+  const f = fixFor(it), out = [];
+  const add = (level, code, msg) => out.push({ level, code, msg });
+  if (it.page_item !== it.item) {
+    add("warn", "number", it.page_item === null || it.page_item === undefined
+      ? `No item number was read from the page; numbered ${it.item} by page order.`
+      : it.dup_number
+        ? `Another page was also read as item ${it.page_item}; this one is item ${it.item} by page order.`
+        : `The page header was read as item ${it.page_item}; numbered ${it.item} by page order.`);
+  }
+  const det = detectedLetters(it);
+  const n = choiceCount(it);
+  if (!f.nchoices) {
+    if (!det.length) {
+      add("warn", "nochoices", "No answer choices were read from the page; the letter buttons offer A to E. " +
+        "Set the number of choices if the page shows more or fewer.");
+    } else if (det.join("") !== LETTERS.slice(0, det.length)) {
+      add("warn", "letters", `Choice letters were read as ${det.join(" ")}, not ` +
+        `${LETTERS.slice(0, det.length).split("").join(" ")}.`);
+    }
+  }
+  if (DATA.hasKeyPdf && !it.answer_available) {
+    add("error", "nokey", "No correct-answer letter was found for this item in the answer key.");
+  } else if (it.answer_available && n && LETTERS.indexOf(it.correct) >= n) {
+    add("error", "keyrange", `The key says ${it.correct}, but the choices run A to ${LETTERS[n - 1]}.`);
+  }
+  if (!it.content && rowsOverlap(it)) {
+    add("warn", "overlap", "The choice rows read from the page overlap, so a click on the page " +
+      "could pick the neighbouring letter. The letter buttons under the page always work.");
+  }
+  if (it.content && contentStem(it.content).length < 10) {
+    add("warn", "nostem", "No question text was read. Show it as the page image instead.");
+  }
+  if (it.key_note && !f.key) {
+    add("warn", "keytext", (it.key_note.kind === "removed"
+      ? "The answer key marks this question as removed: "
+      : "The answer key is unsure about this one: ") + `“${it.key_note.snippet}”`);
+  }
+  if (!it.content) {
+    add("info", "image", f.image ? "Shown as the page image (your choice)."
+      : "Shown as the page image, because its choices weren't read as text.");
+  }
+  if (f.removed || f.ignored) out.forEach((x) => { x.resolved = true; });
+  // what matters for the score first: key problems, then the rest
+  const rank = (x) => x.level === "error" ? 0 : x.code === "keytext" ? 1 : x.level === "warn" ? 2 : 3;
+  return out.sort((a, b) => rank(a) - rank(b));
+}
+function itemStatus(it) {
+  const flags = itemChecks(it);
+  const need = flags.some((x) => x.level !== "info" && !x.resolved);
+  return { flags, need, fixed: !need && hasFix(fixFor(it)) };
+}
+
+/* Plain-language list of the fixes in effect, for the check screen and the
+   export. */
+function describeFix(f) {
+  const parts = [];
+  if (f.key) parts.push(`key set to ${f.key}`);
+  if (f.nchoices) parts.push(`${f.nchoices} choices (A to ${LETTERS[f.nchoices - 1]})`);
+  if (f.image) parts.push("shown as page image");
+  if (f.removed) parts.push("marked removed, not scored");
+  if (f.ignored) parts.push("flag ignored");
+  return parts.join("; ");
+}
+function appliedFixes() {
+  return DATA.items.filter((it) => hasFix(fixFor(it)))
+    .map((it) => Object.assign({ item: it.item, note: describeFix(fixFor(it)) }, fixFor(it)));
+}
+
+/* ---------------- the check screen ---------------- */
+let ckAll = false;            // list every item, not just the flagged ones
+const ckOpen = new Set();     // expanded rows, by index
+
+function showCheckScreen() {
+  $("pickWrap").style.display = "none";
+  $("checkWrap").style.display = "block";
+  ckAll = false;
+  ckOpen.clear();
+  renderCheck();
+}
+
+function checkSummary() {
+  const st = DATA.items.map((it) => itemStatus(it));
+  const need = st.filter((s) => s.need).length;
+  const fixed = st.filter((s) => s.fixed).length;
+  const removed = DATA.items.filter((it) => it.removed).length;
+  const images = DATA.items.filter((it) => !it.content).length;
+  const keyed = DATA.items.filter((it) => it.answer_available && !it.removed).length;
+  const nokey = DATA.hasKeyPdf
+    ? DATA.items.filter((it) => !it.answer_available && !it.removed).length : 0;
+  return { st, need, fixed, removed, images, keyed, nokey, good: DATA.count - need };
+}
+function summaryText(s) {
+  let t = s.need
+    ? `${s.good} of ${DATA.count} look good, ${s.need} need${s.need === 1 ? "s" : ""} a look`
+    : `All ${DATA.count} items look good`;
+  const extra = [];
+  if (s.fixed) extra.push(`${s.fixed} fixed by you`);
+  if (s.removed) extra.push(`${s.removed} removed from scoring`);
+  return t + (extra.length ? ` (${extra.join(", ")})` : "");
+}
+function summaryDetail(s) {
+  const bits = [];
+  bits.push(DATA.hasKeyPdf ? `${s.keyed} keyed` : "no answer key, so the sitting is unscored");
+  if (s.images) bits.push(`${s.images} shown as page image${s.images === 1 ? "" : "s"}`);
+  if (DATA.renumbered) bits.push("item numbers set by page order");
+  return bits.join(" · ");
+}
+
+function renderCheck() {
+  const s = checkSummary();
+  const card = $("checkCard");
+  card.classList.toggle("ck-compact", !s.need && !ckAll);
+  if (!s.need && !ckAll) {
+    card.innerHTML =
+      `<div class="ck-line"><span class="ck-tick">✓</span>` +
+      `<span class="ck-sum" id="ckSum">${escHtml(summaryText(s))}</span>` +
+      `<span class="ck-detail">${escHtml(summaryDetail(s))}</span>` +
+      `<a href="#" class="ck-link" data-ck="all">See items</a>` +
+      `<button class="ck-start" data-ck="start">Start exam</button></div>`;
+    return;
+  }
+  let html =
+    `<div class="ck-head"><div><div class="ck-title">Check before you start</div>` +
+    `<div class="ck-sum" id="ckSum">${escHtml(summaryText(s))}</div>` +
+    `<div class="ck-detail" id="ckDetail">${escHtml(summaryDetail(s))}</div></div>` +
+    `<button class="ck-start" data-ck="start">Start exam</button></div>` +
+    `<p class="ck-note">Nothing here stops you starting. Open an item to see its page beside ` +
+    `what was read from it, and fix it in one click. Fixes are saved in this browser for this ` +
+    `PDF and applied again whenever you load it.</p>` +
+    (s.nokey >= 5
+      ? `<p class="ck-note ck-warn">The answer key couldn't be read for ${s.nokey} items. You can still ` +
+        `sit the exam: after End Block, each of those items asks for its correct letter and the ` +
+        `score updates as you go.</p>` : "") +
+    `<div class="ck-list" id="ckList">`;
+  s.st.forEach((st, i) => {
+    if (ckAll || st.need || st.fixed) html += checkRowHtml(i, st);
+  });
+  html += `</div><div class="ck-foot"><label class="ck-all"><input type="checkbox" data-ck="all"` +
+    `${ckAll ? " checked" : ""}> Show all ${DATA.count} items</label>` +
+    `<button class="ck-start" data-ck="start">Start exam</button></div>`;
+  card.innerHTML = html;
+}
+
+function checkRowHtml(i, st) {
+  const it = DATA.items[i];
+  st = st || itemStatus(it);
+  const cls = st.need ? "need" : st.fixed ? "fixed" : "ok";
+  const chip = st.need ? "Needs a look" : st.fixed ? "Fixed" : "OK";
+  const open = ckOpen.has(i);
+  const live = st.flags.filter((x) => x.level !== "info" && !x.resolved);
+  const msg = st.need
+    ? live[0].msg + (live.length > 1 ? ` (+${live.length - 1} more)` : "")
+    : st.fixed ? describeFix(fixFor(it))
+    : (st.flags[0] ? st.flags[0].msg : "Read cleanly.");
+  return `<div class="ck-row ${cls}${open ? " open" : ""}" data-i="${i}">` +
+    `<div class="ck-rhead" data-ck="toggle"><span class="ck-chip">${chip}</span>` +
+    `<b class="ck-num">Item ${it.item}</b><span class="ck-msg">${escHtml(msg)}</span>` +
+    `<span class="ck-caret"></span></div>` +
+    (open ? checkBodyHtml(i, st) : "") + `</div>`;
+}
+
+function checkBodyHtml(i, st) {
+  const it = DATA.items[i], o = it._orig, f = fixFor(it);
+  const det = detectedLetters(it);
+  const n = choiceCount(it);
+  const url = DATA.qURLs[i];
+  const flags = st.flags.map((x) =>
+    `<li class="lv-${x.level}${x.resolved ? " resolved" : ""}">${escHtml(x.msg)}</li>`).join("");
+  const keyLetters = LETTERS.slice(0, Math.max(n || 5,
+    it.correct ? LETTERS.indexOf(it.correct) + 1 : 0)).split("");
+  const stem = o.content ? contentStem(o.content) : "";
+  const choicesRead = o.content && o.content.choices.length
+    ? o.content.choices.map((c) => `<div class="ck-ch"><b>${c.letter}.</b> ${escHtml(runsText(c.runs))}</div>`).join("")
+    : (det.length ? escHtml(det.join(" ")) : "none");
+  let sel = `<option value="">as read${n ? ` (${n})` : " (none)"}</option>`;
+  for (let k = 2; k <= 26; k++) {
+    sel += `<option value="${k}"${f.nchoices === k ? " selected" : ""}>${k} (A to ${LETTERS[k - 1]})</option>`;
+  }
+  const chk = (name, on, label, dis) =>
+    `<label class="ck-opt"><input type="checkbox" data-fix="${name}"${on ? " checked" : ""}` +
+    `${dis ? " disabled" : ""}> ${label}</label>`;
+  return `<div class="ck-body"><div class="ck-page">` +
+    (url ? `<img class="ck-qimg" src="${url}" alt="question page">`
+         : `<div class="ck-noimg">No page render is available for this item.</div>`) +
+    (it.a_group !== null && it.a_group !== undefined
+      ? `<button class="ck-btn" data-ck="apage">Show answer-key page</button>` +
+        `<img class="ck-aimg" alt="answer-key page" style="display:none">` : "") +
+    `</div><div class="ck-parse">` +
+    (flags ? `<ul class="ck-flags">${flags}</ul>` : "") +
+    `<dl class="ck-dl">` +
+    `<dt>Item number</dt><dd>${it.item}` +
+    (it.page_item !== it.item ? ` <span class="ck-dim">(page header: ${it.page_item ?? "none"})</span>` : "") + `</dd>` +
+    `<dt>Key</dt><dd>${it.correct ? `<b>${it.correct}</b>` + (f.key ? ` <span class="ck-dim">(set by you; read: ${o.correct || "none"})</span>` : "") : "none"}</dd>` +
+    `<dt>Shown as</dt><dd>${it.content ? "text" : "page image"}</dd>` +
+    (stem ? `<dt>Question</dt><dd class="ck-stem">${escHtml(stem.length > 260 ? stem.slice(0, 260) + "…" : stem)}</dd>` : "") +
+    `<dt>Choices read</dt><dd>${choicesRead}</dd></dl>` +
+    `<div class="ck-fixes">` +
+    `<div class="ck-frow"><span class="ck-lab">Correct answer</span>` +
+    keyLetters.map((L) => `<button class="ck-key${it.correct === L ? " on" : ""}" data-key="${L}">${L}</button>`).join("") +
+    (f.key ? `<a href="#" class="ck-link" data-ck="clearkey">use the key as read</a>` : "") + `</div>` +
+    `<div class="ck-frow"><span class="ck-lab">Number of choices</span>` +
+    `<select data-fix="nchoices">${sel}</select></div>` +
+    `<div class="ck-frow ck-checks">` +
+    (o.content ? chk("image", f.image, "Show as page image", !url)
+               : `<label class="ck-opt ck-dim">Already shown as the page image</label>`) +
+    chk("removed", f.removed, "Removed question (not scored)") +
+    chk("ignored", f.ignored, "Looks right, ignore") + `</div>` +
+    (hasFix(f) ? `<div class="ck-frow"><a href="#" class="ck-link" data-ck="reset">Undo my fixes for this item</a></div>` : "") +
+    `</div></div></div>`;
+}
+
+/* Re-render one row and the summary in place, so the list doesn't jump. */
+function refreshCheckRow(i) {
+  const old = document.querySelector(`#ckList .ck-row[data-i="${i}"]`);
+  if (old) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = checkRowHtml(i);
+    old.replaceWith(tmp.firstChild);
+  }
+  const s = checkSummary();
+  if ($("ckSum")) $("ckSum").textContent = summaryText(s);
+  if ($("ckDetail")) $("ckDetail").textContent = summaryDetail(s);
+}
+
+function wireCheck() {
+  const card = $("checkCard");
+  card.addEventListener("click", async (e) => {
+    const t = e.target;
+    const ck = t.closest("[data-ck]");
+    const row = t.closest(".ck-row");
+    const i = row ? +row.dataset.i : -1;
+    const it = i >= 0 ? DATA.items[i] : null;
+    const keyBtn = t.closest("[data-key]");
+    if (keyBtn && it) {
+      setFix(it, { key: keyBtn.dataset.key });
+      refreshCheckRow(i);
+      return;
+    }
+    if (!ck) return;
+    const what = ck.dataset.ck;
+    if (what === "start") { enterExam(); return; }
+    if (what === "all" && ck.tagName === "A") { e.preventDefault(); ckAll = true; renderCheck(); return; }
+    if (what === "toggle" && it) {
+      if (ckOpen.has(i)) ckOpen.delete(i); else ckOpen.add(i);
+      refreshCheckRow(i);
+      return;
+    }
+    if (what === "clearkey" && it) { e.preventDefault(); setFix(it, { key: null }); refreshCheckRow(i); return; }
+    if (what === "reset" && it) { e.preventDefault(); delete FIX.items[it.item]; saveFixes(); applyFixes(); refreshCheckRow(i); return; }
+    if (what === "apage" && it) {
+      const img = row.querySelector(".ck-aimg");
+      if (img.style.display === "none") {
+        ck.textContent = "Loading…";
+        const url = await DATA.answerURL(i);
+        if (url) { img.src = url; img.style.display = "block"; }
+        ck.textContent = url ? "Hide answer-key page" : "No answer-key page";
+      } else {
+        img.style.display = "none";
+        ck.textContent = "Show answer-key page";
+      }
+    }
+  });
+  card.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.dataset.ck === "all") { ckAll = t.checked; renderCheck(); return; }
+    const name = t.dataset.fix;
+    const row = t.closest(".ck-row");
+    if (!name || !row) return;
+    const i = +row.dataset.i, it = DATA.items[i];
+    if (name === "nchoices") setFix(it, { nchoices: t.value ? parseInt(t.value, 10) : null });
+    else setFix(it, { [name]: t.checked });
+    refreshCheckRow(i);
+  });
+}
+
+function enterExam() {
+  $("landing").style.display = "none";
+  $("app").style.display = "flex";
+  boot(DATA);
+}
+
+/* ------------------------------------------------------------------ */
 /* landing: choose PDFs, parse in-browser, then boot                   */
 /* ------------------------------------------------------------------ */
 function wireDrop(dropId, txtId, inputId) {
@@ -107,20 +549,33 @@ async function startExam() {
     // "not in answer key" and left out of the percentage
     const aBytes = af ? await af.arrayBuffer() : null;
     const sid = await sha16(qBytes.slice(0));
+    // keepPageImages: every item keeps its page render, so the check screen
+    // can show it and any item can be switched to image mode
     const data = await window.parseExam(qBytes, aBytes, (label, frac) => {
       $("progressLabel").textContent = label;
       $("progressFill").style.width = Math.round(frac * 100) + "%";
-    });
+    }, { keepPageImages: true });
     if (!data.count) throw new Error("no question pages found");
     data.minutes = minutes;
     data.sid = sid;
-    $("landing").style.display = "none";
-    $("app").style.display = "flex";
-    boot(data);
+    data.hasKeyPdf = !!aBytes;
+    prepareData(data);
   } catch (e) {
     showError("Could not read that PDF (" + (e.message || e) + "). Make sure " +
       "it is the self-assessment questions PDF (and, if you chose one, the " +
       "matching answer-key PDF).");
+    return;
+  }
+  // the checks only advise: if anything in them fails, start the exam anyway
+  try {
+    if (DATA.hasKeyPdf) {
+      $("progressLabel").textContent = "Checking the answer key…";
+      await scanKeyText((f) => { $("progressFill").style.width = Math.round(f * 100) + "%"; });
+    }
+    showCheckScreen();
+  } catch (e) {
+    console.error(e);
+    enterExam();
   }
 }
 
@@ -128,7 +583,7 @@ async function startExam() {
 /* boot                                                                */
 /* ------------------------------------------------------------------ */
 function boot(data) {
-  DATA = data;
+  prepareData(data);              // numbering + saved fixes (no-op if done)
   LSKEY = "sa_exam_" + DATA.sid;  // isolate saved state per exam file
   loadState();
   S.hlw = S.hlw || {};            // state saved by older versions lacks this
@@ -184,11 +639,11 @@ function updateSidebar() {
     const your = S.answers[it.item];
     r.classList.toggle("answered", !!your);
     r.classList.toggle("marked", !!S.marks[it.item]);
-    r.classList.toggle("unavail", !it.answer_available);
+    r.classList.toggle("unavail", !it.answer_available || it.removed);
     r.classList.toggle("current", i === cur);
     r.classList.remove("r-correct", "r-wrong", "r-skip", "r-none");
     if (reviewing) {
-      r.classList.add(!it.answer_available ? "r-none"
+      r.classList.add(!it.answer_available || it.removed ? "r-none"
         : !your ? "r-skip"
         : your === it.correct ? "r-correct" : "r-wrong");
     }
@@ -214,7 +669,14 @@ function showItem(i) {
   $("prevBtn").disabled = cur === 0;
   $("nextBtn").disabled = cur === DATA.count - 1;
   $("proceedBtn").style.visibility = cur === DATA.count - 1 ? "hidden" : "visible";
-  $("unavail").style.display = it.answer_available ? "none" : "block";
+  const ban = $("unavail");
+  if (it.removed) {
+    ban.textContent = "This item is marked as a removed question; it won't be scored.";
+  } else if (!it.answer_available) {
+    ban.textContent = "⚠︎ No answer-key letter was found for this item. " +
+      "After End Block you can enter the correct letter to score it.";
+  }
+  ban.style.display = it.answer_available && !it.removed ? "none" : "block";
 
   if (it.content) {
     $("stage").style.display = "none";
@@ -223,15 +685,31 @@ function showItem(i) {
   } else {
     $("qhtml").style.display = "none";
     $("stage").style.display = "block";
+    $("stage").style.height = "";
     const img = $("qimg");
     overlay().innerHTML = "";
     img.onload = () => layoutItem(it);
     img.src = DATA.qURLs[cur];
     if (img.complete && img.naturalWidth) layoutItem(it);
   }
+  renderLetterRow(it);
   $("content").scrollTop = 0;
   updateSidebar();
   saveState();
+}
+
+/* A small row of letter buttons under every item. It answers exactly like
+   clicking a choice, and it is the way in when the choices weren't read:
+   the user reads the page image and taps the letter. With no letters read
+   it offers A to E and a "+" for longer lists. */
+function renderLetterRow(it) {
+  const your = S.answers[it.item];
+  const letters = lettersFor(it);
+  const plus = !detectedLetters(it).length && letters.length < 26;
+  $("letterRow").innerHTML = `<span class="lr-lab">Answer</span>` +
+    letters.map((L) => `<button class="lr-btn${your === L ? " sel" : ""}" data-letter="${L}" ` +
+      `title="Answer ${L}">${L}</button>`).join("") +
+    (plus ? `<button class="lr-btn lr-plus" title="This item has more choices: add a letter">+</button>` : "");
 }
 
 /* ------------------------------------------------------------------ */
@@ -341,6 +819,13 @@ function layoutItem(it) {
 
   buildTextLayer(it, w, h);
   drawHighlights(it);
+
+  // clip the page just below its last word or choice (as review does), so
+  // the letter row sits under the choices, not after a page of white space;
+  // with nothing read the whole page stays visible
+  const lastChoice = it.choices.length ? Math.max(...it.choices.map((c) => c.row[3])) : 1;
+  const lastWord = it.words.length ? Math.max(...it.words.map((wd) => wd[3])) : 1;
+  $("stage").style.height = Math.min(h, Math.max(lastChoice, lastWord) * h + 16) + "px";
 }
 
 /* Positioned choice-row element (radio + strike line), shared by the exam
@@ -464,6 +949,8 @@ function selectChoice(letter) {
     ? document.querySelectorAll("#qhtml .copt")
     : overlay().querySelectorAll(".choice");
   sel.forEach((el) => el.classList.toggle("sel", el.dataset.letter === letter));
+  document.querySelectorAll("#letterRow .lr-btn").forEach((el) =>
+    el.classList.toggle("sel", el.dataset.letter === letter));
   updateSidebar();
   saveState();
 }
@@ -802,6 +1289,43 @@ function wireChrome() {
     if (opt) { e.preventDefault(); toggleStrike(opt.dataset.letter); }
   });
 
+  // the letter row under every item
+  $("letterRow").addEventListener("click", (e) => {
+    if (reviewing || paused) return;
+    const b = e.target.closest && e.target.closest(".lr-btn");
+    if (!b) return;
+    const it = item(cur);
+    if (b.classList.contains("lr-plus")) {
+      setFix(it, { nchoices: lettersFor(it).length + 1 });
+      renderLetterRow(it);
+      return;
+    }
+    selectChoice(b.dataset.letter);
+  });
+
+  // review: enter / change the key, restore a removed item
+  $("resultstrip").addEventListener("click", (e) => {
+    if (!reviewing) return;
+    const it = item(cur);
+    const k = e.target.closest && e.target.closest("[data-key]");
+    if (k) {
+      setFix(it, { key: k.dataset.key });
+      rescore();
+      showReview(cur);
+      return;
+    }
+    const a = e.target.closest && e.target.closest("[data-act]");
+    if (!a) return;
+    if (a.dataset.act === "restore") {
+      setFix(it, { removed: false });
+      rescore();
+      showReview(cur);
+    } else if (a.dataset.act === "changekey") {
+      const kp = $("resultstrip").querySelector(".kp");
+      if (kp) kp.style.display = kp.style.display === "none" ? "" : "none";
+    }
+  });
+
   // modal close handlers
   document.querySelectorAll(".modal-back").forEach((m) => {
     m.addEventListener("click", (e) => {
@@ -827,8 +1351,7 @@ function wireChrome() {
     else if (!reviewing) {
       const it = item(cur);
       const L = e.key.toUpperCase();
-      const letters = it.content ? it.content.choices.map((c) => c.letter)
-                                 : it.choices.map((c) => c.letter);
+      const letters = lettersFor(it);
       if (/^[A-Z]$/.test(L) && letters.includes(L)) selectChoice(L);
       else if (/^[1-9]$/.test(e.key)) {
         const c = letters[parseInt(e.key, 10) - 1];
@@ -965,28 +1488,49 @@ function buildEndText() {
 function submitExam() {
   if (timerInt) { clearInterval(timerInt); timerInt = null; }
   setPaused(false);
-  let correct = 0, scored = 0;
-  DATA.items.forEach((it) => {
-    if (!it.answer_available) return;
-    scored++;
-    if (S.answers[it.item] && S.answers[it.item] === it.correct) correct++;
-  });
-  const pct = scored ? Math.round((correct / scored) * 100) : 0;
-  DATA._score = { correct, scored, pct };
   reviewing = true;
+  rescore();
   $("content").style.display = "none";
   $("reviewbar").style.display = "flex";
   $("reviewwrap").style.display = "block";
-  $("scoreBig").textContent = pct + "%";
-  const naCount = DATA.count - scored;
-  $("scoreSub").innerHTML =
-    `${correct} / ${scored} correct` +
-    (naCount ? ` &nbsp;·&nbsp; ${naCount} item(s) had no answer key and were not scored` : "");
   $("hlBtn").style.display = "none";
   $("clearHlBtn").style.display = "none";
   $("pauseBtn").style.display = "none";
   $("endBtn").style.display = "none";
   showReview(0);
+}
+
+/* Score against the key as fixed: removed items and items with no key are
+   left out of the denominator. Re-run whenever a key is entered in review. */
+function computeScore() {
+  let correct = 0, scored = 0, removed = 0, nokey = 0;
+  DATA.items.forEach((it) => {
+    if (it.removed) { removed++; return; }
+    if (!it.answer_available) { nokey++; return; }
+    scored++;
+    if (S.answers[it.item] && S.answers[it.item] === it.correct) correct++;
+  });
+  const pct = scored ? Math.round((correct / scored) * 100) : 0;
+  return { correct, scored, pct, removed, nokey };
+}
+function rescore() {
+  const sc = DATA._score = computeScore();
+  $("scoreBig").textContent = sc.pct + "%";
+  $("scoreSub").innerHTML =
+    `${sc.correct} / ${sc.scored} correct` +
+    (sc.nokey ? ` &nbsp;·&nbsp; ${sc.nokey} item(s) had no answer key and were not scored` : "") +
+    (sc.removed ? ` &nbsp;·&nbsp; ${sc.removed} removed question(s) not scored` : "");
+  updateSidebar();
+}
+
+/* Letter buttons for entering or correcting an item's key in review. */
+function keyPickerHtml(it, label, hidden) {
+  const letters = lettersFor(it);
+  if (it.correct && !letters.includes(it.correct)) letters.push(it.correct);
+  return `<span class="kp"${hidden ? ' style="display:none"' : ""}>` +
+    `<span class="kp-lab">${label}</span>` +
+    letters.map((L) => `<button class="kp-btn${it.correct === L ? " on" : ""}" data-key="${L}">${L}</button>`).join("") +
+    `</span>`;
 }
 
 async function showReview(i) {
@@ -1009,25 +1553,33 @@ async function showReview(i) {
   expl.style.display = "none";
   origWrap.style.display = "none";
 
-  if (!it.answer_available) {
-    strip.className = "resultstrip na";
-    strip.innerHTML = `<b>Item ${it.item}</b> <span class="pill">Your answer: ${your || "—"}</span>` +
-      `<span class="pill">Not in answer key</span>`;
-    rstage.style.display = "none";
-    $("rhtml").style.display = "none";
-    na.style.display = "block";
-    na.innerHTML = `The answer-key PDF did not include item ${it.item}, so it can't be shown here ` +
-      `and wasn't counted in your score.`;
-    return;
-  }
   na.style.display = "none";
-  const isCorrect = your && your === it.correct;
-  strip.className = "resultstrip " + (isCorrect ? "correct" : (your ? "wrong" : "skipped"));
-  strip.innerHTML =
-    `<b>Item ${it.item}</b>` +
-    `<span class="pill">Your answer: <b>${your || "— (blank)"}</b></span>` +
-    `<span class="pill">Correct: <b>${it.correct}</b></span>` +
-    `<span>${isCorrect ? "✓ Correct" : (your ? "✗ Incorrect" : "○ Skipped")}</span>`;
+  const keyed = it.answer_available && !!it.correct;
+  const hasPage = it.a_group !== null && it.a_group !== undefined;
+  if (it.removed) {
+    strip.className = "resultstrip na";
+    strip.innerHTML = `<b>Item ${it.item}</b>` +
+      `<span class="pill">Your answer: <b>${your || "—"}</b></span>` +
+      (keyed ? `<span class="pill">Key: <b>${it.correct}</b></span>` : "") +
+      `<span class="pill">Removed question, not scored</span>` +
+      `<button class="rs-link" data-act="restore">Score it again</button>`;
+  } else if (!keyed) {
+    strip.className = "resultstrip na";
+    strip.innerHTML = `<b>Item ${it.item}</b>` +
+      `<span class="pill">Your answer: <b>${your || "—"}</b></span>` +
+      `<span class="pill">No key letter, not scored</span>` +
+      keyPickerHtml(it, hasPage || DATA.hasKeyPdf ? "Correct answer per the page?" : "Correct answer?", false);
+  } else {
+    const isCorrect = your && your === it.correct;
+    strip.className = "resultstrip " + (isCorrect ? "correct" : (your ? "wrong" : "skipped"));
+    strip.innerHTML =
+      `<b>Item ${it.item}</b>` +
+      `<span class="pill">Your answer: <b>${your || "— (blank)"}</b></span>` +
+      `<span class="pill">Correct: <b>${it.correct}</b></span>` +
+      `<span>${isCorrect ? "✓ Correct" : (your ? "✗ Incorrect" : "○ Skipped")}</span>` +
+      `<button class="rs-link" data-act="changekey" title="If the key letter was misread">Key wrong?</button>` +
+      keyPickerHtml(it, "Correct answer per the page?", true);
+  }
 
   // the question as YOU left it: your pick, strikes, highlights — plus
   // right/wrong markers
@@ -1058,6 +1610,14 @@ async function showReview(i) {
     const url = await DATA.answerURL(cur);
     if (cur !== requested || !reviewing) return;
     if (url) { img.src = url; img.style.display = "block"; }
+    else if (!keyed && !it.removed) {
+      na.style.display = "block";
+      na.textContent = DATA.hasKeyPdf
+        ? `No answer-key page was matched to item ${it.item}. If you know the answer, ` +
+          `tap its letter above and the score updates.`
+        : `No answer key was loaded. If you know the answer, tap its letter above ` +
+          `and the score updates.`;
+    }
   }
 }
 
@@ -1174,12 +1734,14 @@ function runsText(runs) {
 }
 function itemResult(it) {
   const your = S.answers[it.item];
+  if (it.removed) return "removed";
   if (!it.answer_available) return "no_key";
   if (!your) return "skipped";
   return your === it.correct ? "correct" : "incorrect";
 }
 async function buildExport(includeExpl, onProgress) {
-  const sc = DATA._score || { correct: 0, scored: 0, pct: 0 };
+  const sc = computeScore();     // the key as fixed, removed items left out
+  const fixes = appliedFixes();
   const items = [];
   for (let i = 0; i < DATA.items.length; i++) {
     const it = DATA.items[i];
@@ -1191,6 +1753,8 @@ async function buildExport(includeExpl, onProgress) {
       marked: !!S.marks[it.item],
       struck: Object.keys(S.struck[it.item] || {}).sort(),
     };
+    if (hasFix(fixFor(it))) rec.fix = describeFix(fixFor(it));
+    if (it.page_item !== it.item) rec.page_item = it.page_item;
     if (it.content) {
       rec.stem = it.content.blocks.filter((b) => b.t === "p").map((b) => runsText(b.runs)).join("\n");
       rec.choices = it.content.choices.map((c) => ({ letter: c.letter, text: runsText(c.runs) }));
@@ -1204,7 +1768,7 @@ async function buildExport(includeExpl, onProgress) {
     }
     items.push(rec);
   }
-  const counts = { correct: 0, incorrect: 0, skipped: 0, no_key: 0 };
+  const counts = { correct: 0, incorrect: 0, skipped: 0, no_key: 0, removed: 0 };
   items.forEach((r) => counts[r.result]++);
   const json = {
     title: DATA.title || "Self-Assessment",
@@ -1213,13 +1777,17 @@ async function buildExport(includeExpl, onProgress) {
     started_at: S.startedAt ? new Date(S.startedAt).toISOString() : null,
     score: { correct: sc.correct, scored: sc.scored, pct: sc.pct },
     counts, items,
+    fixes,
+    renumbered: !!DATA.renumbered,
   };
 
-  const mark = { correct: "✓ Correct", incorrect: "✗ Incorrect", skipped: "○ Skipped", no_key: "– Not in key" };
+  const mark = { correct: "✓ Correct", incorrect: "✗ Incorrect", skipped: "○ Skipped",
+                 no_key: "– Not in key", removed: "⊘ Removed" };
   const md = [];
   md.push(`# ${json.title} — results`);
   md.push(`Exported ${json.exported_at.slice(0, 10)}. Score **${sc.correct}/${sc.scored} (${sc.pct}%)** — ` +
-    `${counts.incorrect} incorrect, ${counts.skipped} skipped, ${counts.no_key} not in key.`);
+    `${counts.incorrect} incorrect, ${counts.skipped} skipped, ${counts.no_key} not in key` +
+    (counts.removed ? `, ${counts.removed} removed (not scored)` : "") + ".");
   const missed = items.filter((r) => r.result === "incorrect" || r.result === "skipped").map((r) => r.item);
   const marked = items.filter((r) => r.marked).map((r) => r.item);
   md.push(`Missed: ${missed.length ? missed.join(", ") : "none"}. Marked: ${marked.length ? marked.join(", ") : "none"}.`);
@@ -1227,6 +1795,14 @@ async function buildExport(includeExpl, onProgress) {
   md.push("| Item | Yours | Key | Result | Marked |");
   md.push("|---|---|---|---|---|");
   items.forEach((r) => md.push(`| ${r.item} | ${r.your || "—"} | ${r.correct || "—"} | ${mark[r.result]} | ${r.marked ? "yes" : ""} |`));
+  if (fixes.length || DATA.renumbered) {
+    md.push("");
+    md.push("## Fixes applied");
+    if (DATA.renumbered) {
+      md.push("- Item numbers were set by page order (the page headers repeated or skipped a number).");
+    }
+    fixes.forEach((f) => md.push(`- Item ${f.item}: ${f.note}`));
+  }
   const hasDetail = items.some((r) => r.stem || r.explanation);
   if (hasDetail) {
     md.push("");
@@ -1299,4 +1875,5 @@ document.addEventListener("DOMContentLoaded", () => {
     wireDrop("drop-a", "txt-a", "file-a");
     $("go").addEventListener("click", startExam);
   }
+  if ($("checkCard")) wireCheck();
 });

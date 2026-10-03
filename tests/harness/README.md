@@ -62,6 +62,23 @@ that no row contains another choice's radio centre, and that rows sharing a
 column don't overlap. Exits non-zero on any failure. This is the regression
 test for two-column choice grids.
 
+## Check-screen test
+
+```sh
+PROSE_KEY=<dir>/2A_key.pdf HARNESS_PROFILE=<dir>/profile \
+  node tests/harness/checkscreen.mjs
+```
+
+Drives the real page through its file inputs and asserts the safety nets: the
+check screen's counts (clean Surgery 3, unkeyed Internal Medicine 6, Surgery 2
+with a prose key whose item 40 is REMOVED), renumbering of a repeated item
+number, a key fix and a "removed" fix surviving a reload (`sa_fix_<sid>`), the
+letter row under every item, review-mode key entry rescoring live, and the
+export honouring the fixes. `FORMS_DIR` points at the folder of forms,
+`PROSE_KEY` at the key made with `tools/make_key_pdf.py` (keep it outside the
+repo; the scenario is skipped without it), `ONLY=clean,dup,broken,prose` picks
+scenarios, `CS_OUT` is where screenshots go, default port 8791.
+
 ## Diffing a change
 
 Keep a baseline directory, rerun into a second directory, then compare

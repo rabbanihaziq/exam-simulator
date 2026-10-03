@@ -51,7 +51,7 @@
 <!-- ================= landing / upload ================= -->
 <div id="landing">
   <div class="topstripe"></div>
-  <div class="wrap">
+  <div class="wrap" id="pickWrap">
     <div class="card">
       <h1>Self-Assessment Exam Simulator</h1>
       <p class="sub">Load a questions PDF and its answer-key PDF to start a timed, exam-style session. Without the answer key the sitting still works; it just isn't scored.</p>
@@ -99,6 +99,11 @@
         and jump around with the Question Status list.
       </div>
     </div>
+  </div>
+
+  <!-- after parsing, before the clock starts: what was read, and fixes -->
+  <div class="wrap ckwrap" id="checkWrap" style="display:none">
+    <div class="card ckcard" id="checkCard"></div>
   </div>
 </div>
 
@@ -205,6 +210,8 @@
           <img id="qimg" alt="question">
           <div id="overlay"></div>
         </div>
+        <!-- always-there answer letters: work even when the choices weren't read -->
+        <div id="letterRow" class="letterrow"></div>
         <div id="proceedWrap"><button id="proceedBtn">Proceed to Next Item</button></div>
       </div>
 
