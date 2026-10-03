@@ -256,6 +256,117 @@ function radioForLetter(data, w, h, box) {
 
 /* ---------------- PDF.js text extraction -------------------------------- */
 
+/* ---------------- word breaks from the content stream ------------------- */
+
+/* pdf.js decides where one word ends from the gaps between glyphs, and that
+   fails on a text layer laid down fragment by fragment. Internal Medicine 6's
+   questions carry Acrobat's OCR layer, which places every few letters with a
+   matrix of its own ("(w)" Tm "(hi)" Tm "(te )"), so the gaps come out wherever
+   the invisible font's widths disagree with the scan, and the stems read
+   "w hite man", "n ot iced", "ab normalities". That layer does say where its
+   words end, though: it writes a space glyph after every one. So each word
+   break pdf.js reports is checked against the content stream -- a break is
+   kept when a space glyph (or a word-sized TJ shift) stands there, or when
+   the gap is wide (a table's column), and dropped otherwise. Only a page that
+   writes its spaces this way (at least 60 percent of the breaks between
+   separately placed runs) is touched; any page whose glyphs cannot be lined
+   up with pdf.js's text exactly is left as pdf.js read it. */
+const breakCache = new WeakMap();
+
+async function fixWordBreaks(page, tc) {
+  if (breakCache.has(tc)) return;
+  breakCache.set(tc, true);
+  // reading the operator list costs far more than the text, so only a page
+  // laid down in fragments pays for it: most items a few letters long
+  const frags = tc.items.filter((it) => (it.str || "").trim());
+  const short = frags.filter((it) => it.str.trim().length <= 4).length;
+  if (frags.length < 20 || short / frags.length < 0.4) return;
+  let ops;
+  try { ops = await page.getOperatorList({ intent: "print" }); } catch (e) { return; }
+  const OPS = window.pdfjsLib.OPS;
+  // the content stream's glyphs, in order: whether a space precedes each one
+  // and whether it opens a separately placed run
+  const seq = [];
+  let pend = false;
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    if (ops.fnArray[i] !== OPS.showText) continue;
+    let first = true, kern = 0;
+    for (const g of ops.argsArray[i][0] || []) {
+      if (typeof g === "number") { kern += g; continue; }
+      if (!g) continue;
+      const u = (g.unicode || "").normalize("NFKC");
+      if (g.isSpace || (u && !u.trim())) { pend = true; continue; }
+      const chars = [...u.replace(/\s/g, "")];
+      if (!chars.length) continue;
+      const wide = -kern / 1000 >= 0.2;
+      chars.forEach((ch, k) => seq.push({ ch, sp: !k && (pend || wide), run: !k && first }));
+      pend = false; first = false; kern = 0;
+    }
+  }
+  // pdf.js's breaks: a space inside an item, or the start of an item on the
+  // same line as the one before it
+  const items = tc.items;
+  const pos = [];       // per non-space char: [item, index in str]
+  const brk = [];       // per non-space char: "s" in-string space, "i" item start, ""
+  let prevY = null, prevEnd = null;
+  items.forEach((it, ii) => {
+    const chars = [...(it.str || "")];
+    const firstK = chars.findIndex((c) => c.trim());
+    if (firstK < 0) return;          // a whitespace-only item
+    const y = it.transform[5], x = it.transform[4];
+    const sameLine = prevY !== null &&
+      Math.abs(y - prevY) <= Math.max(2, (it.height || 10) * 0.3);
+    let sawSp = false;
+    chars.forEach((ch, k) => {
+      if (!ch.trim()) { sawSp = true; return; }
+      let b = "";
+      if (k === firstK) b = sameLine ? "i" : "";
+      else if (sawSp) b = "s";
+      pos.push([ii, k]);
+      brk.push({ b, gap: b === "i" ? x - prevEnd : null, h: it.height || 10 });
+      sawSp = false;
+    });
+    prevY = y; prevEnd = x + it.width;
+  });
+  // the two have to be the same glyphs, or nothing here can be trusted
+  const tcChars = pos.map(([ii, k]) => [...items[ii].str][k]);
+  if (tcChars.length !== seq.length) return;
+  for (let k = 0; k < seq.length; k++) {
+    if (tcChars[k].normalize("NFKC") !== seq[k].ch) return;
+  }
+  // does this page write its spaces?
+  let runBreaks = 0, spaced = 0;
+  brk.forEach((b, k) => {
+    if (!b.b || !seq[k].run) return;
+    runBreaks++;
+    if (seq[k].sp) spaced++;
+  });
+  if (runBreaks < 10 || spaced / runBreaks < 0.6) return;
+  // drop the breaks the stream does not back
+  const dropAt = new Map();   // item -> set of string indices whose preceding space goes
+  brk.forEach((b, k) => {
+    if (!b.b || seq[k].sp) return;
+    if (b.b === "i" && b.gap !== null && b.gap > b.h * 0.3) return;   // a column
+    const [ii, idx] = pos[k];
+    if (b.b === "i") { items[ii].glue = true; return; }
+    if (!dropAt.has(ii)) dropAt.set(ii, new Set());
+    dropAt.get(ii).add(idx);
+  });
+  dropAt.forEach((set, ii) => {
+    const chars = [...items[ii].str];
+    let out = "";
+    chars.forEach((ch, k) => {
+      if (!ch.trim()) {
+        // a run of whitespace goes when the character after it was marked
+        let j = k; while (j < chars.length && !chars[j].trim()) j++;
+        if (set.has(j)) return;
+      }
+      out += ch;
+    });
+    items[ii].str = out;
+  });
+}
+
 /* Reconstruct a page's text lines (top first), keeping each line's baseline
    y so callers can detect paragraph breaks from vertical spacing.
    foldSubscripts widens baseline merging so sub/superscripts (e.g. the 4 in
@@ -263,6 +374,7 @@ function radioForLetter(data, w, h, box) {
    not on dense tables, so it's opt-in (used for explanation extraction). */
 async function getPageLines(page, foldSubscripts) {
   const tc = await page.getTextContent();
+  await fixWordBreaks(page, tc);
   const rows = new Map();  // rounded baseline y -> [{x, w, str}]
   for (const it of tc.items) {
     if (!it.str) continue;
@@ -274,7 +386,7 @@ async function getPageLines(page, foldSubscripts) {
     }
     if (row === null) { rows.set(y, []); row = y; }
     rows.get(row).push({ x: it.transform[4], w: it.width,
-                         h: it.height || 10, str: it.str });
+                         h: it.height || 10, str: it.str, glue: it.glue });
   }
   const ordered = [...rows.entries()].sort((a, b) => b[0] - a[0]); // top first
   return ordered.map(([y, items]) => {
@@ -287,7 +399,7 @@ async function getPageLines(page, foldSubscripts) {
     let line = "", endX = null, pendingSpace = false;
     for (const i of items) {
       if (!i.str.trim()) { pendingSpace = true; continue; }
-      if (endX !== null) line += (pendingSpace || i.x - endX > i.h * 0.21) ? " " : "";
+      if (endX !== null && !i.glue) line += (pendingSpace || i.x - endX > i.h * 0.21) ? " " : "";
       line += i.str;
       endX = i.x + i.w;
       pendingSpace = false;
@@ -323,6 +435,7 @@ async function renderPage(page, viewport, ctx) {
    called after the page has been rendered so commonObjs is populated. */
 async function getPageWords(page, viewport) {
   const tc = await page.getTextContent();
+  await fixWordBreaks(page, tc);
   const U = window.pdfjsLib.Util;
   const fcache = {};
   function fontFlags(fname) {
@@ -350,6 +463,14 @@ async function getPageWords(page, viewport) {
     for (const match of str.matchAll(/\S+/g)) {
       const f0 = match.index / str.length;
       const f1 = (match.index + match[0].length) / str.length;
+      // the rest of a word the run before this one started (fixWordBreaks)
+      const last = raw[raw.length - 1];
+      if (it.glue && match.index === str.search(/\S/) && last &&
+          Math.abs(last.base - yBase) < fh * 0.3) {
+        last.text += match[0];
+        last.x1 = x + wpx * f1;
+        continue;
+      }
       raw.push({
         x0: x + wpx * f0, x1: x + wpx * f1,
         y0: yBase - fh, y1: yBase + fh * 0.25,
