@@ -1771,7 +1771,7 @@ async function looksLikeScreenshot(doc, pno) {
    `fresh` (0-based page indices) are pages known to start a new item, from
    the shot check in parseExam; `skip` are the stub pages to leave out (see
    stubPages). */
-function numberPages(texts, fresh, skip) {
+function numberPages(texts, fresh, skip, railNums) {
   fresh = fresh || new Set();
   skip = skip || new Set(stubPages(texts));
   const total = declaredTotalOf(texts);
@@ -1779,7 +1779,11 @@ function numberPages(texts, fresh, skip) {
   texts.forEach((t, i) => {
     if (skip.has(i)) return;
     pages.push(i);
-    cands.push(pageNumberCandidates(t, total));
+    const c = pageNumberCandidates(t, total);
+    // the row the question-status rail highlights counts as a header
+    const r = railNums && railNums[i];
+    if (r && (!total || r <= total)) c.set(r, (c.get(r) || 0) + 3);
+    cands.push(c);
   });
   // The exam's cover (see dropCoverPages): leading pages with no number and
   // no answer choices, while nearly every page after them is numbered, are
@@ -2997,7 +3001,11 @@ function stripStatusRail(rec, pageW) {
     const w = L.w.filter((t) => !(t[0] < cut && t[1] < left - f * 0.3));
     if (w.length) L2.push({ ...L, w });
   }
-  return { rec: { ...rec, L: L2 }, edge: Math.min(left - f * 0.5, railX1 + f * 6) };
+  // the rail's rows as a line, baseline = off + n * pitch, for railItem
+  const off = median(run.map((t) => t.b - t.n * pitch));
+  const rail = { x0: Math.min(...col.map((t) => t.x0)), x1: railX1, off, pitch, f,
+                 nLo: run[0].n, nHi: run[run.length - 1].n };
+  return { rec: { ...rec, L: L2 }, edge: Math.min(left - f * 0.5, railX1 + f * 6), rail };
 }
 
 /* One accessor for a document's text, whether it has a text layer or was
@@ -3031,6 +3039,13 @@ function makeSource(doc, ocrPages) {
     // points (0 when the page has none)
     async railEdge(p) {
       return ocrPages ? (await ocrPage(p)).edge : 0;
+    },
+    // the item the rail marks as the current one, or null (see railItem)
+    async railItem(p) {
+      if (!ocrPages) return null;
+      const { rail } = await ocrPage(p);
+      if (!rail) return null;
+      try { return await railItem(await doc.getPage(p), rail); } catch (e) { return null; }
     },
   };
 }
@@ -3433,6 +3448,62 @@ async function readAnnotatedKey(doc, src, hash, onProgress, nItems) {
   return key;
 }
 
+/* The question-status rail paints the current item's row solid blue, with
+   its number in white, and that row names the page's item even where the
+   header bar cannot be read: Internal Medicine 10's bar was read on fewer
+   than half its pages, the numbering fell back to header-and-position, and
+   five extra items came out. The rail's rows lie at a fixed pitch
+   (stripStatusRail fits off + n * pitch to the numbers it read), so the blue
+   band's height on the page gives the number. Exactly one band of a row's
+   height inside the rail, or nothing. */
+async function railItem(page, rail) {
+  const vp1 = page.getViewport({ scale: 1 });
+  const k = Math.min(2, 900 / vp1.width);
+  const vp = page.getViewport({ scale: k });
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(vp.width));
+  c.height = Math.max(1, Math.round(vp.height));
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  await renderPage(page, vp, ctx);
+  const x0 = Math.max(0, Math.floor(rail.x0 * k)), x1 = Math.min(c.width, Math.ceil(rail.x1 * k));
+  if (x1 - x0 < 2) return null;
+  const d = ctx.getImageData(x0, 0, x1 - x0, c.height).data;
+  c.width = c.height = 1;
+  const W = x1 - x0;
+  const blue = [];
+  for (let y = 0; y < d.length / 4 / W; y++) {
+    let n = 0;
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      if (d[i + 2] > 120 && d[i + 2] - d[i] > 70) n++;
+    }
+    blue.push(n / W > 0.4);
+  }
+  // rows above the first number read are still rail (OCR misses some, the
+  // white-on-blue one most of all), down to row 1
+  const lo = (rail.off + 0.3 * rail.pitch) * k;
+  const hi = (rail.off + (rail.nHi + 1.5) * rail.pitch) * k;
+  const gap = rail.pitch * 0.3 * k;     // a flag or the white digits split a band
+  const bands = [];
+  for (let y = 0; y < blue.length; y++) {
+    if (!blue[y]) continue;
+    let e = y;
+    for (;;) {
+      while (e + 1 < blue.length && blue[e + 1]) e++;
+      let g = e + 1;
+      while (g < blue.length && !blue[g] && g - e <= gap) g++;
+      if (g < blue.length && blue[g] && g - e <= gap) e = g; else break;
+    }
+    const h = (e - y + 1) / k;
+    if (h >= rail.pitch * 0.5 && h <= rail.pitch * 1.4 && y >= lo && e <= hi) bands.push((y + e) / 2 / k);
+    y = e;
+  }
+  if (bands.length !== 1) return null;
+  // the band is centred on its row, about a third of a line above the baseline
+  const n = Math.round((bands[0] + rail.f * 0.35 - rail.off) / rail.pitch);
+  return n >= 1 ? n : null;
+}
+
 /* Blank the question-status rail out of a rendered page (see
    stripStatusRail), so its shading, flags and the scrollbar beside it are
    never taken for an exhibit or a radio circle. Only the copy the parser
@@ -3744,9 +3815,12 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   // Only where the numbering leaves room for an item, though: a phone
   // capture opens each exhibit full screen ("1 of 1") between two shots of
   // its item, and that is a picture with no text, not an item.
+  // the item each page's question-status rail highlights, where it has one
+  const qRail = [];
+  for (let i = 1; i <= nq; i++) qRail.push(await qSrc.railItem(i));
   const stubs = new Set(stubPages(qTexts));
   {
-    const first = numberPages(qTexts, new Set(), stubs);
+    const first = numberPages(qTexts, new Set(), stubs, qRail);
     const numAt = new Map();
     first.groups.forEach((g, k) => g.forEach((p) => numAt.set(p - 1, first.nums[k])));
     for (const i of [...stubs]) {
@@ -3760,7 +3834,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   }
   const fresh = new Set();
   const knownOffsets = new Map();     // "p,q" -> offset of page q below page p, or null
-  let ident = numberPages(qTexts, fresh, stubs);
+  let ident = numberPages(qTexts, fresh, stubs, qRail);
   // Pages that share a number must also share content: check that each shot
   // continues the one before it, and renumber with the ones that do not as
   // items of their own. Each round can only add pages to `fresh`, so this
@@ -3790,7 +3864,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       }
     }
     if (!changed) break;
-    ident = numberPages(qTexts, fresh, stubs);
+    ident = numberPages(qTexts, fresh, stubs, qRail);
   }
   for (const [p] of shotCache) if (!ident.groups.some((g) => g.length > 1 && g.includes(p))) shotCache.delete(p);
   // Too few readable numbers for a sequence: group by header and number by
