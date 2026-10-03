@@ -132,7 +132,8 @@ function contentBand(data, w, h) {
   let top = 0, bottom = h;
   const topBand = dark.filter((y) => y < h * 0.22);
   const botBand = dark.filter((y) => y > h * 0.78);
-  if (topBand.length) top = Math.max(...topBand) + 1;
+  if (topBand.length) top = barEnd(dark, Math.max(...topBand), h) + 1;
+  else if (dark.length) top = pastedHeader(data, w, h, dark);
   if (botBand.length) bottom = Math.min(...botBand);
   else if (dark.length) {
     // A capture pasted onto a larger sheet leaves white below it, so the
@@ -183,6 +184,44 @@ function contentBand(data, w, h) {
   }
   if (bottom - top < h * 0.3) return [0, h];
   return [top, bottom];
+}
+
+/* The last row of the navy run that `from` belongs to. A header bar that
+   straddles the 0.22 cut (Psychiatry 8 page 6 runs from 0.19 to 0.26 of the
+   page) used to end at the cut, leaving the bottom half of the bar and its
+   labels in the content. */
+function barEnd(dark, from, h) {
+  const isDark = new Set(dark);
+  let end = from;
+  while (end < h * 0.5 && (isDark.has(end + 1) || isDark.has(end + 2))) {
+    end += isDark.has(end + 1) ? 1 : 2;
+  }
+  return end;
+}
+
+/* The header bar of a capture pasted part-way down a larger sheet. Psychiatry
+   8's question pages put the screenshot a third of the way down an A4 page
+   with nothing above it, so its navy bar sits below the 0.22 cut and the
+   band fell back to the whole page; the bar and the blank sheet above it then
+   became a "figure" that was followed down through the choice box and
+   swallowed every choice (22 items to image mode). The first navy run is the
+   header when it starts in the upper half and only blank page lies above it.
+   Returns the row the content starts at, or 0. */
+function pastedHeader(data, w, h, dark) {
+  const end = barEnd(dark, dark[0], h);
+  if (dark[0] > h * 0.5 || end - dark[0] < h * 0.015) return 0;
+  // the bar's own anti-aliased edge is not page content
+  for (let y = 0; y < dark[0] - 4; y += 2) {
+    const row = y * w * 4;
+    let ink = 0, n = 0;
+    for (let x = 0; x < w; x += 3) {
+      const i = row + x * 4;
+      if (Math.min(data[i], data[i + 1], data[i + 2]) < 235) ink++;
+      n++;
+    }
+    if (ink / n > 0.02) return 0;
+  }
+  return end + 1;
 }
 
 /* Locate the radio circle left of a choice-letter box. Returns [cx,cy,r]. */
