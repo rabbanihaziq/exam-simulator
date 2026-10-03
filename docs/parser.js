@@ -1157,6 +1157,12 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     // pitch below the last choice: a wrapped continuation of that choice opens
     // there too, but sits about half a pitch under the line above it, so the
     // gap to the nearest line above is what tells the two apart.
+    const misread = misreadLabel(raw, prev, L, pitch, bottom);
+    if (misread) {
+      ordered.push([L, { ...misread, relabelled: true, src: misread }]);
+      code++;
+      continue;
+    }
     const orphan = boxes.size >= 2 && orphanRow(raw, [...boxes], prev, pitch, bottom);
     if (!orphan) break;
     ordered.push([L, { x0: prev.x0, x1: prev.x1,
@@ -1166,6 +1172,30 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     code++;
   }
   return ordered;
+}
+
+/* A label OCR read with the wrong punctuation: "FE" or "FE." for "F." on
+   Internal Medicine 9 (items 4, 19, 36), whose capture app sets the dot tight
+   against the letter. Without it the run stopped at E and the last choice
+   ("Cystoscopy") was read as the tail of E's text. The token must start with
+   the letter the run is waiting for, followed by at most two characters that
+   are not lower-case (so "For" opening a vignette never qualifies), sit in the label
+   column, one row pitch below the last choice, with the choice's text after
+   it on the same line. */
+function misreadLabel(raw, prev, L, pitch, bottom) {
+  const lh = prev.y1 - prev.y0;
+  const rx = new RegExp("^" + L + "[^a-z\\s]{0,2}$");
+  for (const wd of raw) {
+    if (!rx.test(wd.text) || wd.y1 > bottom) continue;
+    if (Math.abs(wd.x0 - prev.x0) > lh * 0.6) continue;
+    if (Math.abs(wd.base - prev.base - pitch) > pitch * 0.35) continue;
+    const tol = (wd.y1 - wd.y0) * 0.5;
+    const after = raw.some((o) => o !== wd && Math.abs(o.base - wd.base) <= tol &&
+                                  o.x0 >= wd.x1 - 1 && o.x0 - wd.x1 < lh * 1.5 &&
+                                  /[A-Za-z0-9]/.test(o.text));
+    if (after) return wd;
+  }
+  return null;
 }
 
 /* The first word of a choice whose label OCR lost: it opens where the other
@@ -2643,6 +2673,14 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
         // pyogenes (group A)" on Form 4 item 44, "E. coli" on Form 5 item 9,
         // both of which this flagged as broken runs until it asked.
         const lh = wd.y1 - wd.y0;
+        // The radio circle read as a label of its own ("O)" in front of
+        // "B." on Internal Medicine 9, whose capture app draws a hollow
+        // circle a little way left of the letter) is not a lost choice: the
+        // row's real label sits right after it.
+        if (ordered.some(([, bx]) => Math.abs(bx.base - wd.base) <= lh * 0.5 &&
+                                     bx.x0 >= wd.x1 - 2 && bx.x0 - wd.x1 < lh * 1.5)) {
+          return false;
+        }
         return !rawWords.some((o) => o !== wd && Math.abs(o.base - wd.base) <= lh * 0.5 &&
                                      o.x1 <= wd.x0 + 2 && wd.x0 - o.x1 < lh * 0.6 &&
                                      !LABEL_JUNK.test(o.text));
