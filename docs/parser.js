@@ -942,6 +942,7 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
   // word's width moves its centre up or down out of its own row, while every
   // word on a visual line shares a baseline whatever its size.
   const choices = [];
+  const labelLeft = Math.min(...pxChoices.map((c) => c.lx0));
   for (let ci = 0; ci < pxChoices.length; ci++) {
     const pc = pxChoices[ci];
     // A boundary sits a fraction of a line above the next choice's baseline:
@@ -973,8 +974,32 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
                                cy > f.y0 - 4 && cy < f.y1 + 4);
     });
     if (!cws.length) return null;  // image choices etc: fall back whole item
+    let cLines = clusterTextLines(cws);
+    // The last choice's band runs to the foot of the content, and on a page
+    // with no footer bar that is the foot of the sheet: a OneNote clipping
+    // (Internal Medicine 1 and 2) prints "New Section 1 Page 2" there, and it
+    // became the end of choice E. A choice's own lines follow each other
+    // closely, so stop at the first one a blank of two lines or more below.
+    // Nor does a choice's text share a line with anything left of the labels:
+    // the newer client's "Proceed to Next Item" button sits just under the
+    // choice box, starting at the stem margin, and "to Next Item" was being
+    // read as the end of the last choice (Internal Medicine 10 item 25).
+    if (pc.nextBase == null) {
+      const lh = pc.lw.y1 - pc.lw.y0;
+      let last = pc.base;
+      const kept = [];
+      for (const l of cLines) {
+        if (l.base - last > lh * 3) break;
+        if (raw.some((w) => Math.abs(w.base - l.base) <= lh * 0.5 &&
+                            w.x0 < labelLeft - lh * 0.5 && /[A-Za-z]{2,}/.test(w.text))) break;
+        kept.push(l);
+        last = l.base;
+      }
+      if (!kept.length) return null;
+      cLines = kept;
+    }
     const runs = [];
-    clusterTextLines(cws).forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
+    cLines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
     choices.push({ letter: pc.letter, runs });
   }
   return { blocks, choices };
@@ -1568,14 +1593,66 @@ function loadTesseract() {
    key can be mixed. */
 async function docIsImageOnly(doc) {
   const n = Math.min(3, doc.numPages);
-  let chars = 0;
+  let chars = 0, untexted = 0;
   for (let i = 1; i <= n; i++) {
     const page = await doc.getPage(i);
     const tc = await page.getTextContent();
     for (const it of tc.items) chars += (it.str.match(/[A-Za-z0-9]/g) || []).length;
+    try {
+      if (await screenshotUntexted(page, tc)) untexted++;
+    } catch (e) { /* no operator list: judge by the text alone */ }
     page.cleanup();
   }
-  return chars / n < 60;
+  return chars / n < 60 || untexted === n;
+}
+
+/* A page can carry a real text layer and still have its question only as a
+   picture. Internal Medicine 1 and 2 are OneNote clippings: OneNote writes
+   the clipping's date, "Screen Clipping" and "New Section 1 Page 4" as text,
+   which clears the 60-character bar above, while the NBME screenshot under
+   them is an image with no text at all -- so nothing was recognised and the
+   forms came out as 8 and 2 items. Such a page has wide images covering a
+   fair part of it (a short item's clipping fills barely a quarter of the
+   sheet) with (almost) no text over them; a PDF whose screenshots
+   carry a text layer (an OCR'd export, or the client's own print) has its
+   text right on top of them. Measured in display space, after the page's
+   rotation, because OneNote prints landscape pages rotated. */
+async function screenshotUntexted(page, tc) {
+  const U = window.pdfjsLib.Util, OPS = window.pdfjsLib.OPS;
+  const vp = page.getViewport({ scale: 1 });
+  const ops = await page.getOperatorList();
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [], boxes = [];
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i], args = ops.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+    else if (fn === OPS.transform) ctm = U.transform(ctm, args);
+    else if (fn === OPS.paintFormXObjectBegin) {
+      stack.push(ctm);
+      if (args && args[0]) ctm = U.transform(ctm, args[0]);
+    } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+      const m = U.transform(vp.transform, ctm);
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map((p) => U.applyTransform(p, m));
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      boxes.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+    }
+  }
+  const W = vp.width, H = vp.height;
+  const wide = boxes.filter((b) => b[2] - b[0] >= W * 0.5);
+  if (!wide.length) return false;
+  const pts = tc.items.filter((it) => /[A-Za-z0-9]/.test(it.str)).map((it) => {
+    const m = U.transform(vp.transform, it.transform);
+    return { x: m[4], y: m[5], n: (it.str.match(/[A-Za-z0-9]/g) || []).length };
+  });
+  let area = 0;
+  for (const b of wide) {
+    let inside = 0;
+    for (const p of pts) if (p.x >= b[0] && p.x <= b[2] && p.y >= b[1] && p.y <= b[3]) inside += p.n;
+    if (inside < 40) area += (b[2] - b[0]) * (b[3] - b[1]);
+  }
+  return area >= W * H * 0.15;
 }
 
 async function sha256Hex(bytes) {
