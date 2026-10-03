@@ -1186,6 +1186,295 @@ function itemGroups(texts) {
   return groupPages(nums).map((g) => g.map((i) => pages[i]));
 }
 
+/* ---------------- question-page identity -------------------------------- */
+
+/* Which item does each question page show? itemGroups trusts one number per
+   page, and across the shared corpus that number is wrong often enough to
+   cost an exam its count:
+     - OCR misreads the header's digits ("Item 39" as "Item 38", "of 50" as
+       "of 20") or drops a word of it ("Exam Section 32 of 50");
+     - a screenshot taken while the client was still loading the next item
+       shows the old header over the new item ("Item 17 of 50 / Please Wait"
+       above "18. A 32-year-old ..."), so the header is one behind the stem;
+     - a matching or sequential set is headed "Item 44-45 of 50" and numbers
+       its members "Item 1 of 2", "Item 2 of 2", and the first header-shaped
+       text on the page was the sub-number;
+     - the capture app leaves a page with no header at all.
+   So every page offers candidates, each with a weight -- the header, a
+   header that lost its "Item", the number printed before the stem -- and the
+   numbering is chosen for the whole document at once: the run of numbers
+   that agrees best with the candidates while reading as a sequence that
+   never goes backwards. A wrong header is outvoted by its own stem and by
+   its neighbours; a page with nothing readable takes the number its
+   neighbours leave free. */
+
+// "Item 7 of 50", "Question 7 Of 50", "item 7 of 50", "Items 44-45 of 50"
+const HEADER_ANY = /\b(?:Item|Question)s?\s*(\d{1,3})(?:\s*[-–—]\s*(\d{1,3}))?\s*of\s*(\d{1,3})?/i;
+const HEADER_ALL = new RegExp(HEADER_ANY.source, "gi");
+
+/* The exam's length, from the "of N" its page headers print, or null. Taken
+   only when it is the clear majority, so one misread total ("of 20") cannot
+   set it. */
+function declaredTotalOf(texts) {
+  const counts = new Map();
+  let n = 0;
+  for (const t of texts) {
+    const m = t.match(HEADER_ANY);
+    if (!m || !m[3]) continue;
+    const total = parseInt(m[3], 10);
+    if (total < 2) continue;
+    counts.set(total, (counts.get(total) || 0) + 1);
+    n++;
+  }
+  let best = null, bestN = 0;
+  for (const [t, c] of counts) if (c > bestN) { best = t; bestN = c; }
+  return best !== null && bestN >= 3 && bestN >= n * 0.5 ? best : null;
+}
+
+/* Candidate item numbers for one page, as a Map number -> weight. */
+function pageNumberCandidates(text, total) {
+  const cands = new Map();
+  const add = (n, w) => {
+    if (!(n >= 1) || (total && n > total)) return;
+    cands.set(n, (cands.get(n) || 0) + w);
+  };
+  const lines = text.split("\n");
+  // A capture taken while the client was still loading the next item says
+  // so, and its header is the previous item's: it gets a single vote.
+  const stale = /\bPl[eo]ase\s*Wait\b/i.test(text);
+  // The page header: header-shaped text whose total is the exam's. A set's
+  // own "Item 2 of 2" has a total of its own and is never the header. A page
+  // whose header strip was read twice (whole page and strip) can carry two,
+  // and when they disagree both are offered.
+  const headers = [];
+  for (const m of text.matchAll(HEADER_ALL)) {
+    const t = m[3] ? parseInt(m[3], 10) : null;
+    if (total && t !== null && t !== total) continue;
+    if (!total && t !== null && t < parseInt(m[1], 10)) continue;
+    headers.push(m);
+  }
+  const seen = new Set();
+  for (const header of headers) {
+    const s = parseInt(header[1], 10);
+    const e = header[2] ? parseInt(header[2], 10) : null;
+    let n = s, w = stale ? 1 : 3;
+    if (e !== null && e > s && e - s < 10) {
+      // "Item 44-45 of 50": the set's members open with "Item k of m", and a
+      // member's page shows every member up to its own, so the highest k
+      // that opens a line ("45. Item 2 of 2") is the one this page is for.
+      // Mid-line ("to view Item 2 of 2") it is only the client's prompt.
+      let k = 0;
+      const subRx = new RegExp("(?:^|\\n)[^\\S\\n]*(?:\\d{1,3}[^\\S\\n]*\\.[^\\S\\n]*)?Item[^\\S\\n]*(\\d)[^\\S\\n]*of[^\\S\\n]*" + (e - s + 1) + "\\b", "gi");
+      for (const m of text.matchAll(subRx)) k = Math.max(k, parseInt(m[1], 10));
+      if (k >= 1 && k <= e - s + 1) n = s + k - 1;
+      else w = Math.min(w, 2);
+    }
+    if (seen.has(n)) continue;
+    seen.add(n);
+    add(n, w);
+  }
+  if (total) {
+    // a header that OCR stripped of its "Item": "Exam Section 32 of 50"
+    const rx = new RegExp("\\b(\\d{1,3})\\s*of\\s*" + total + "\\b", "i");
+    for (const l of lines.slice(0, 3)) {
+      const m = l.match(rx);
+      if (!m || HEADER_ANY.test(l)) continue;
+      const n = parseInt(m[1], 10);
+      if (!seen.has(n)) { seen.add(n); add(n, stale ? 1 : 2); }
+    }
+  }
+  // The number printed before the stem ("18. A 32-year-old ..."). OCR can
+  // lose the word after it ("28. man with gout"), so any letter may follow.
+  // With a bracket at or below choice A it is a choice label ("1)" for I),
+  // not a number at all; a matching set prints its stems after the choices,
+  // so a dotted number below them still counts.
+  const firstChoice = text.match(FIRST_CHOICE);
+  const stems = new Set();
+  for (const m of text.matchAll(/(?:^|\n)[^\S\n]*(\d{1,3})[^\S\n]*([.)])[^\S\n]+[A-Za-z(]/g)) {
+    if (m[2] === ")" && firstChoice && m.index >= firstChoice.index) continue;
+    stems.add(parseInt(m[1], 10));
+  }
+  for (const n of stems) add(n, 2);
+  return cands;
+}
+
+/* Choose one number per page (null for a page with no candidates) so that
+   the numbers never decrease and agree with the candidates as well as
+   possible. `fresh` holds page indices already known to start a new item
+   (their shots do not line up with the page before), which must therefore
+   take a number above it. A dynamic programme over the last number used and
+   the count of unnumbered pages since it: a number skipped where an
+   unnumbered page stands is that page's number, not a missing item. */
+function chooseNumbers(cands, fresh, maxN) {
+  const n = cands.length;
+  const Z = 4;                        // unnumbered pages tracked since the last number
+  const NEG = -1e9;
+  const at = (v, z) => v * Z + z;
+  let dp = new Array((maxN + 1) * Z).fill(NEG);
+  dp[at(0, 0)] = 0;
+  const back = [];   // back[i][state] = [previous state, chosen number or null]
+  for (let i = 0; i < n; i++) {
+    const nd = new Array((maxN + 1) * Z).fill(NEG);
+    const bk = new Array((maxN + 1) * Z).fill(null);
+    for (let v = 0; v <= maxN; v++) {
+      for (let z = 0; z < Z; z++) {
+        const cur = dp[at(v, z)];
+        if (cur === NEG) continue;
+        // No number for this page: the last one carries on. Refusing every
+        // number a page offers costs a little, or a page could hand its
+        // number to the page after it for free.
+        const skip = cur - (cands[i].size ? 1 : 0);
+        const zs = at(v, Math.min(Z - 1, z + 1));
+        if (skip > nd[zs]) { nd[zs] = skip; bk[zs] = [at(v, z), null]; }
+        for (const [c, w] of cands[i]) {
+          if (c > maxN || c < v || (c === v && (fresh.has(i) || v === 0 || z))) continue;
+          // The next item scores, a continuation shot is neutral, and a
+          // number skipped with no page to hold it costs a little (a form
+          // can really be missing items).
+          const gap = Math.max(0, c - v - 1 - z);
+          const step = c === v ? 0 : gap ? -1 - 0.1 * gap : 2;
+          const s = cur + w + step;
+          const ns = at(c, 0);
+          if (s > nd[ns]) { nd[ns] = s; bk[ns] = [at(v, z), c]; }
+        }
+      }
+    }
+    dp = nd;
+    back.push(bk);
+  }
+  let st = 0;
+  for (let k = 1; k < dp.length; k++) if (dp[k] > dp[st]) st = k;
+  const out = new Array(n).fill(null);
+  for (let i = n - 1; i >= 0; i--) {
+    const [ps, c] = back[i][st];
+    out[i] = c;
+    st = ps;
+  }
+  return out;
+}
+
+/* Pages that name no item and hold too little text to be one: ObGyn Form 9's
+   Touch Bar strip, Psychiatry Form 1's "Q 1 (missing)" placeholders. Returned
+   as 0-based indices; the caller may veto any of them (a full screenshot that
+   OCR simply failed to read is still an item). */
+function stubPages(texts) {
+  const total = declaredTotalOf(texts);
+  const out = [];
+  texts.forEach((t, i) => {
+    if (pageNumberCandidates(t, total).size) return;
+    if ((t.match(/[A-Za-z]{2,}/g) || []).length < 10) out.push(i);
+  });
+  return out;
+}
+
+/* A stub by its text can still be a full screenshot whose text OCR could
+   not read (Family Medicine Form 4's growth-chart item came back as eight
+   words of noise), and that is an item, not filler. Tell the two apart by
+   the picture: a page of ordinary proportions with real ink on it. The Touch
+   Bar strip is thirty times wider than tall, a "Q 1 (missing)" placeholder is
+   a line of text on white. */
+async function looksLikeScreenshot(doc, pno) {
+  try {
+    const page = await doc.getPage(pno);
+    const vp1 = page.getViewport({ scale: 1 });
+    const aspect = vp1.height / vp1.width;
+    if (aspect < 0.25 || aspect > 2.5) return false;
+    const vp = page.getViewport({ scale: 240 / vp1.width });
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(vp.width));
+    c.height = Math.max(1, Math.round(vp.height));
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    await renderPage(page, vp, ctx);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    let ink = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i] + d[i + 1] + d[i + 2] < 600) ink++;
+    }
+    return ink / (d.length / 4) > 0.08;
+  } catch (e) { return false; }
+}
+
+/* Number the question pages and group them into items. Returns
+     groups   : [[1-based page, ...], ...]  one per item, in page order
+     nums     : the item number of each group
+     total    : the "of N" the headers declare, or null
+     reliable : false when too few pages carry a readable number for the
+                sequence to mean anything (a client whose header OCR cannot
+                read); the caller then numbers by position as it always did
+   `fresh` (0-based page indices) are pages known to start a new item, from
+   the shot check in parseExam; `skip` are the stub pages to leave out (see
+   stubPages). */
+function numberPages(texts, fresh, skip) {
+  fresh = fresh || new Set();
+  skip = skip || new Set(stubPages(texts));
+  const total = declaredTotalOf(texts);
+  const pages = [], cands = [];
+  texts.forEach((t, i) => {
+    if (skip.has(i)) return;
+    pages.push(i);
+    cands.push(pageNumberCandidates(t, total));
+  });
+  const covered = cands.filter((c) => c.size).length;
+  const reliable = pages.length > 0 && covered >= pages.length * 0.6;
+  let maxN = total || 0;
+  for (const c of cands) for (const k of c.keys()) maxN = Math.max(maxN, k);
+  maxN = Math.max(maxN, pages.length) + 1;
+  const freshIdx = new Set();
+  pages.forEach((p, k) => { if (fresh.has(p)) freshIdx.add(k); });
+  const chosen = chooseNumbers(cands, freshIdx, maxN);
+  const filled = chosen.map((c) => c === null);
+
+  // Pages with no number take the numbers their neighbours leave free, in
+  // order. With none free they are further shots of the item before them --
+  // or, once their shots have been seen not to continue it, the first shot
+  // of the item after them. parseExam checks either guess against the pictures.
+  let k = 0;
+  while (k < chosen.length) {
+    if (chosen[k] !== null) { k++; continue; }
+    let e = k;
+    while (e < chosen.length && chosen[e] === null) e++;
+    const lo = k ? chosen[k - 1] : 0;
+    const hi = e < chosen.length ? chosen[e] : (total ? total + 1 : lo + (e - k) + 1);
+    let next = lo;
+    for (let j = k; j < e; j++) {
+      if (next + 1 < hi) next++;
+      else if (freshIdx.has(j) && e < chosen.length) { chosen[j] = hi; continue; }
+      chosen[j] = Math.max(1, next);
+    }
+    k = e;
+  }
+
+  const groups = [], nums = [], guessed = [];
+  chosen.forEach((num, k2) => {
+    const last = nums.length ? nums[nums.length - 1] : null;
+    if (last === num && !freshIdx.has(k2)) {
+      groups[groups.length - 1].push(pages[k2] + 1);
+      guessed[guessed.length - 1] = guessed[guessed.length - 1] && filled[k2];
+    } else {
+      groups.push([pages[k2] + 1]);
+      nums.push(num);
+      guessed.push(filled[k2]);
+    }
+  });
+  // Last line of defence: two items never share a number, or they would
+  // share one saved answer. The item whose number was read keeps it; one
+  // whose number was only inferred moves to the lowest number above its
+  // predecessor that no item uses, which leaves every other item alone.
+  const owner = new Map();
+  nums.forEach((x, g) => {
+    if (!owner.has(x) || (guessed[owner.get(x)] && !guessed[g])) owner.set(x, g);
+  });
+  const used = new Set(nums);
+  for (let g = 0; g < nums.length; g++) {
+    if (owner.get(nums[g]) === g) continue;
+    let x = (g ? nums[g - 1] : 0) + 1;
+    while (used.has(x)) x++;
+    nums[g] = x;
+    used.add(x);
+  }
+  return { groups, nums, total, reliable };
+}
+
 /* Content words long enough to anchor on, keyed by text, uniques only. */
 function buildAnchors(words, top, bottom) {
   const seen = new Map();
@@ -1285,6 +1574,29 @@ function textFromWords(words) {
     .map((w) => w.text).join(" ")).join("\n");
 }
 
+/* Is shot B the same item as shot A, scrolled further down? Returns the
+   offset in rows, or null when the two do not line up.
+
+   offsetFromText alone is too trusting: two different items share a handful
+   of words ("following", "examination") at much the same height, and that
+   was enough to paint ObGyn Form 7's items 38 and 39 into one page. A real
+   scroll moves the page down, and once B is laid over A at that offset the
+   words of A inside the overlap are found in B again, at the same place. */
+function alignShots(a, b) {
+  const d0 = bandOffset(a, b);
+  if (d0 === null) return null;
+  const bandH = a.band[1] - a.band[0];
+  if (d0 < Math.max(8, bandH * 0.02)) return null;
+  // The pixel search finds the exact row when the shots are the same
+  // pixels, but a phone capture rescales between shots and the search then
+  // wanders off; keep whichever offset the words agree with better.
+  const dt = Math.round(d0);
+  const dp = a.w === b.w ? refineOffset(a.img.data, b.img.data, a.w, a.band, b.band, d0) : dt;
+  const sp = overlapAgreement(a, b, dp), st = dp === dt ? sp : overlapAgreement(a, b, dt);
+  if (Math.max(sp, st) < 0.5) return null;
+  return sp >= st ? dp : dt;
+}
+
 /* offsetFromText measures page rows, the stitch works in content-band rows:
    the same thing only when both shots found their band at the same height,
    which a capture with no chrome bars (where the band falls back to the
@@ -1295,13 +1607,54 @@ function bandOffset(a, b) {
   return d0 === null ? null : d0 - a.band[0] + b.band[0];
 }
 
+/* The same screen captured twice: ObGyn Form 8 holds item 28 on two pages
+   two seconds apart, identical but for the clock. */
+function sameShot(a, b) {
+  return overlapAgreement(a, b, 0) >= 0.8;
+}
+
+/* Of A's words inside the rows B covers when laid `d` rows further down,
+   the share that B prints again at the same place (0 when too few to say). */
+function overlapAgreement(a, b, d) {
+  const bandH = a.band[1] - a.band[0];
+  const lo = d, hi = Math.min(bandH, d + (b.band[1] - b.band[0]));
+  const inB = new Map();
+  for (const wb of b.words) {
+    if (!inB.has(wb.text)) inB.set(wb.text, []);
+    inB.get(wb.text).push(wb);
+  }
+  let n = 0, hit = 0;
+  for (const wa of a.words) {
+    if (wa.text.length < 3 || !/[A-Za-z]/.test(wa.text)) continue;
+    const r = (wa.y0 + wa.y1) / 2 - a.band[0];
+    const lh = wa.y1 - wa.y0;
+    if (r < lo + lh || r > hi - lh) continue;
+    n++;
+    const want = r - d + b.band[0];
+    if ((inB.get(wa.text) || []).some((wb) => Math.abs((wb.y0 + wb.y1) / 2 - want) <= lh * 0.6 &&
+                                             Math.abs(wb.x0 - wa.x0) <= lh)) hit++;
+  }
+  return n >= 3 ? hit / n : 0;
+}
+
+/* Does a shot show a choice list of its own? A first shot whose choices the
+   scroll cut off has none, which is what marks it as the top of an item even
+   when nothing lines it up with the shot below. */
+function shotHasChoices(s) {
+  const strict = choiceRun(s.words, s.band[0], s.band[1], /^([A-Z0])\)$/, false);
+  const loose = choiceRun(s.words, s.band[0], s.band[1],
+                          /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.,)]$/, true);
+  return Math.max(strict.length, loose.length) >= 2;
+}
+
 /* Paint an item's shots into one tall canvas and merge their words without
    duplicating the overlap. A single shot is returned untouched, so forms with
    one page per item take exactly the path they always did.
 
-   `known` optionally gives the offset of each shot below the one before,
-   null meaning "no overlap". Without it the offset is found here; shots with
-   no text to align on are stacked one below the other. Stitching never fails a parse: Pediatrics Forms 7 and 8 capture a
+   `known` optionally gives the offset of each shot below the one before, as
+   the shot check in parseExam measured it, null meaning "no overlap".
+   Without it the offset is found here; shots with no text to align on are
+   stacked one below the other. Stitching never fails a parse: Pediatrics Forms 7 and 8 capture a
    CT image in one shot and the vignette in the next with no line in common,
    and this used to throw and take the whole exam down with it. */
 function stitchShots(shots, known) {
@@ -2075,7 +2428,101 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     prog(`Reading questions…`, 0.25 + (i - 1) / nq * 0.05);
     qTexts.push(await qSrc.text(i));
   }
-  const qGroups = itemGroups(qTexts);
+  // One rendered shot per question page, made at most once: the shot check
+  // renders the pages it looks at, and the item loop takes them over.
+  const shotCache = new Map();
+  async function renderShot(p) {
+    if (shotCache.has(p)) {
+      const s = shotCache.get(p);
+      shotCache.delete(p);
+      return s;
+    }
+    const page = await qdoc.getPage(p);
+    const viewport = page.getViewport({ scale: SCALE });
+    const w = Math.round(viewport.width), h = Math.round(viewport.height);
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const cx = c.getContext("2d", { willReadFrequently: true });
+    await renderPage(page, viewport, cx);
+    const im = cx.getImageData(0, 0, w, h);
+    const band = contentBand(im.data, w, h);
+    if (band[0] === 0 && band[1] === h) bandFallback.questions.push(p);
+    return { canvas: c, img: im, w, h, band, words: await qSrc.words(p, viewport) };
+  }
+  function blankShot() {
+    const c = document.createElement("canvas");
+    c.width = 1200; c.height = 800;
+    const cx = c.getContext("2d", { willReadFrequently: true });
+    cx.fillStyle = "#fff";
+    cx.fillRect(0, 0, c.width, c.height);
+    const words = [];
+    words.itemRects = [];
+    return { canvas: c, img: cx.getImageData(0, 0, c.width, c.height),
+             w: c.width, h: c.height, band: [0, c.height], words };
+  }
+  async function peekShot(p) {
+    if (!shotCache.has(p)) shotCache.set(p, await renderShot(p));
+    return shotCache.get(p);
+  }
+
+  // Which pages are which items (see numberPages). A page that looks like a
+  // stub by its text but is a full screenshot is an item whose text OCR
+  // could not read; it stays, to be shown as an image.
+  // Only where the numbering leaves room for an item, though: a phone
+  // capture opens each exhibit full screen ("1 of 1") between two shots of
+  // its item, and that is a picture with no text, not an item.
+  const stubs = new Set(stubPages(qTexts));
+  {
+    const first = numberPages(qTexts, new Set(), stubs);
+    const numAt = new Map();
+    first.groups.forEach((g, k) => g.forEach((p) => numAt.set(p - 1, first.nums[k])));
+    for (const i of [...stubs]) {
+      let lo = 0, hi = null;
+      for (let j = i - 1; j >= 0; j--) if (numAt.has(j)) { lo = numAt.get(j); break; }
+      for (let j = i + 1; j < qTexts.length; j++) if (numAt.has(j)) { hi = numAt.get(j); break; }
+      if (hi === null) hi = first.total ? first.total + 1 : lo + 2;
+      if (first.reliable && hi - lo >= 2 &&
+          await looksLikeScreenshot(qdoc, i + 1)) stubs.delete(i);
+    }
+  }
+  const fresh = new Set();
+  const knownOffsets = new Map();     // "p,q" -> offset of page q below page p, or null
+  let ident = numberPages(qTexts, fresh, stubs);
+  // Pages that share a number must also share content: check that each shot
+  // continues the one before it, and renumber with the ones that do not as
+  // items of their own. Each round can only add pages to `fresh`, so this
+  // settles within a few rounds.
+  for (let round = 0; ident.reliable && round < 6; round++) {
+    let changed = false;
+    for (const g of ident.groups) {
+      for (let k = 1; k < g.length; k++) {
+        const key = g[k - 1] + "," + g[k];
+        if (knownOffsets.has(key)) continue;
+        let a, b;
+        try {
+          a = await peekShot(g[k - 1]);
+          b = await peekShot(g[k]);
+        } catch (e) { knownOffsets.set(key, null); continue; }
+        if (sameShot(a, b)) { knownOffsets.set(key, "same"); continue; }
+        const d = alignShots(a, b);
+        if (d !== null || !shotHasChoices(a)) {
+          // Lined up, or a first shot whose choices were scrolled off: the
+          // CT image above a vignette that shares no line with it. Without a
+          // verified offset stitchShots finds its own, as it always has.
+          knownOffsets.set(key, d === null ? undefined : d);
+        } else {
+          fresh.add(g[k] - 1);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+    ident = numberPages(qTexts, fresh, stubs);
+  }
+  for (const [p] of shotCache) if (!ident.groups.some((g) => g.length > 1 && g.includes(p))) shotCache.delete(p);
+  // Too few readable numbers for a sequence: group by header and number by
+  // position, as before.
+  const qGroups = ident.reliable ? ident.groups : itemGroups(qTexts);
   const usedItemNos = new Set();
 
   for (let gi = 0; gi < qGroups.length; gi++) {
@@ -2083,24 +2530,26 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     const pno = group[0];
     prog(`Preparing question ${gi + 1} of ${qGroups.length}…`,
          0.3 + gi / qGroups.length * 0.7);
-    const shots = [];
-    for (const p of group) {
-      const page = await qdoc.getPage(p);
-      const viewport = page.getViewport({ scale: SCALE });
-      const w = Math.round(viewport.width), h = Math.round(viewport.height);
-      const c = document.createElement("canvas");
-      c.width = w; c.height = h;
-      const cx = c.getContext("2d", { willReadFrequently: true });
-      await renderPage(page, viewport, cx);
-      const im = cx.getImageData(0, 0, w, h);
-      const band = contentBand(im.data, w, h);
-      if (band[0] === 0 && band[1] === h) bandFallback.questions.push(p);
-      shots.push({ canvas: c, img: im, w, h, band,
-                   words: await qSrc.words(p, viewport) });
+    const shots = [], known = [];
+    let lost = false;
+    for (let k = 0; k < group.length; k++) {
+      let shot;
+      try {
+        shot = await renderShot(group[k]);
+      } catch (e) {
+        lost = true;     // a page pdf.js cannot draw costs that shot, not the exam
+        continue;
+      }
+      const d = k ? knownOffsets.get(group[k - 1] + "," + group[k]) : undefined;
+      if (d === "same" && !lost) continue;      // a second capture of the same screen
+      if (shots.length) known.push(lost || d === "same" ? undefined : d);
+      shots.push(shot);
+      lost = false;
     }
+    if (!shots.length) shots.push(blankShot());
     let st;
     try {
-      st = stitchShots(shots);
+      st = stitchShots(shots, ident.reliable ? known : null);
     } catch (e) {
       st = stitchShots([shots[0]]);    // never lose the exam over one item's layout
     }
@@ -2109,10 +2558,15 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     const w = st.w, h = st.h;
     const cw = st.w, ch = bottom - top;
     const itemText = group.length === 1 ? qTexts[pno - 1] : textFromWords(rawWords);
-    let itemNo = itemNumber(itemText) ?? (gi + 1);
-    // two pages claiming one number would share a saved answer; the later
-    // claim is the suspect one, so it falls back to its position
-    if (usedItemNos.has(itemNo) && !usedItemNos.has(gi + 1)) itemNo = gi + 1;
+    let itemNo;
+    if (ident.reliable) {
+      itemNo = ident.nums[gi];
+    } else {
+      itemNo = itemNumber(itemText) ?? (gi + 1);
+      // two pages claiming one number would share a saved answer; the later
+      // claim is the suspect one, so it falls back to its position
+      if (usedItemNos.has(itemNo) && !usedItemNos.has(gi + 1)) itemNo = gi + 1;
+    }
     usedItemNos.add(itemNo);
 
     if (pno === 1) {
