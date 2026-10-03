@@ -43,8 +43,16 @@ function stemKey(text) {
 /* Two share formats, two page headers: the NBME client prints
    "Exam Section : Item 7 of 50", the app the ObGyn forms come from prints
    "Question 7 Of 50 (03:41)". Either one names the item the page belongs to.
-   The space can be lost by OCR ("Question 35Of Of 50"), so it is optional. */
-const HEADER_ITEM = /(?:Item|Question)\s*(\d+)\s*[Oo]f\b/;
+   The space can be lost by OCR ("Question 35Of Of 50"), so it is optional.
+   The newer NBME client boxes it as "Item: 2 of 50" over "Block: 2 of 2",
+   with a colon (Pediatrics 9, Psychiatry 8).
+   Read off a coloured bar (Internal Medicine 10) the words run together and
+   the capital goes astray: "item2of50", "ttem3of50", "item10f50" for
+   "Item 1 of 50". So the I may be lower case or a t, the "of" may read "0f"
+   and need no space either side, and the number is the shortest run of
+   digits that still leaves an "of" behind it -- "10f50" is item 1, while a
+   clean "10 of 50" or a fused "20of50" still reads 10 and 20. */
+const HEADER_ITEM = /(?:Item|Question|\b[Iil1t]tem)\s*:?\s*(\d+?)\s*[Oo0]f(?![a-z])/;
 
 /* Without a header, a page may still print its number on a line of its own
    ("27." above the NBME chrome on Surgery Form 2). That number always sits
@@ -1159,6 +1167,27 @@ function tidyChoiceWords(raw) {
   return res;
 }
 
+/* The newer NBME client puts its "Mark Question" checkbox (a flag icon and
+   the two words) on a line of its own at the top of the content, under the
+   header bar rather than in it (Pediatrics 9, Psychiatry 8), so it opened
+   every stem as "Mark Question A 13-year-old boy…" and its flag was cropped
+   as an exhibit. When the first line of the content is exactly that, the
+   content starts below it. */
+function belowMarkLine(raw, top, bottom) {
+  const ws = raw.filter((w) => w.y0 >= top - 2 && w.y1 <= bottom);
+  if (!ws.length) return top;
+  const first = ws.reduce((a, b) => (b.base < a.base ? b : a));
+  const lh = first.y1 - first.y0;
+  const line = ws.filter((w) => Math.abs(w.base - first.base) <= lh * 0.5)
+    .sort((a, b) => a.x0 - b.x0);
+  // the checkbox and flag read as junk ("O'®Mark"), and a stitched shot can
+  // repeat the line ("Mark Mark Question Question")
+  const toks = line.map((w) => w.text).join(" ").replace(/[^A-Za-z]+/g, " ")
+    .trim().split(" ").filter((t) => t.length > 1).map((t) => t.toLowerCase());
+  if (!toks.includes("mark") || !toks.every((t) => t === "mark" || t === "question")) return top;
+  return Math.max(...line.map((w) => w.y1)) + lh * 0.3;
+}
+
 /* Consecutive pages sharing one header item number become one group. */
 function groupPages(nums) {
   const groups = [];
@@ -1183,7 +1212,45 @@ function itemGroups(texts) {
     pages.push(i + 1);
     nums.push(n);
   });
+  dropCoverPages(texts, pages, nums);
+  fixStaleHeaders(texts, pages, nums);
   return groupPages(nums).map((g) => g.map((i) => pages[i]));
+}
+
+/* A screenshot taken while the client was still turning the page keeps the
+   previous item's header over the next item's stem: Internal Medicine 2 page
+   21 reads "Item 20 of 50" (with "Please Wait" beside it) above "21. A
+   78-year-old woman…", and the two pages were stitched into one item 20
+   while item 21 vanished. When a page repeats the header before it but its
+   stem opens with the next number, the stem is right. */
+function fixStaleHeaders(texts, pages, nums) {
+  const stemNo = (t) => {
+    const m = t.match(/(?:^|\n)[^\S\n]*(\d{1,3})\.[^\S\n]+[A-Z]/);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  for (let i = 1; i < nums.length; i++) {
+    const n = nums[i];
+    if (n === null || nums[i - 1] !== n) continue;
+    if (stemNo(texts[pages[i] - 1]) !== n + 1) continue;
+    const before = stemNo(texts[pages[i - 1] - 1]);
+    if (before !== null && before !== n) continue;
+    nums[i] = n + 1;
+  }
+}
+
+/* The newer NBME client's capture opens on the exam's cover -- the NBME
+   logo, "Pediatrics Self-Assessment" and a paragraph of copyright notice
+   (Pediatrics 9) -- which is wordy enough to pass for an item and made a
+   51st. A page before the first numbered one is a cover when it carries no
+   number and no answer choices while nearly every page after it is
+   numbered. */
+function dropCoverPages(texts, pages, nums) {
+  const numbered = nums.filter((n) => n !== null).length;
+  if (numbered < nums.length * 0.8) return;
+  while (nums.length && nums[0] === null && !FIRST_CHOICE.test(texts[pages[0] - 1])) {
+    nums.shift();
+    pages.shift();
+  }
 }
 
 /* Content words long enough to anchor on, keyed by text, uniques only. */
@@ -1393,7 +1460,7 @@ const TESS_SRC = `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist
 const OCR_DPI = 200;                   // the screenshots are ~2670px wide: about native
 const OCR_MIN_PX = 3300;               // ...but see the scale note in ocrDocument
 const OCR_MAX_SCALE = 6;               // bound the canvas for a very small page
-const OCR_CACHE_VERSION = 2;           // bump to invalidate every cached page
+const OCR_CACHE_VERSION = 3;           // bump to invalidate every cached page
 const OCR_DB = "exam-parser-ocr", OCR_STORE = "pages";
 
 /* Load tesseract.js on demand. Its worker, wasm core and language data all
@@ -1820,7 +1887,12 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
                                               { blocks: true, text: true });
       const hdr = (data.text.match(HEADER_ITEM) || [])[1] || null;
       const rec = ocrPageRecord(data, scale, canvas.height, hdr);
-      if (!hdr) needHeader.push(p);
+      // A header seen in the raw text can still be lost from the record, when
+      // its fused word ("item3of50") falls under the confidence cut; such a
+      // page is read again like one with no header at all.
+      if (!hdr || !HEADER_ITEM.test(ocrLines(rec).map((l) => l.text).join("\n"))) {
+        needHeader.push(p);
+      }
       pages.set(p, rec);
       canvas.width = canvas.height = 1;      // release the bitmap
       if (db) await idbPut(db, `${hash}:${OCR_CACHE_VERSION}:${p}`, rec);
@@ -1840,23 +1912,60 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
   if (needHeader.length) {
     const hw = await Tesseract.createWorker("eng", 1, wopts);
     await hw.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1" });
+    const barReads = [];
     for (const p of needHeader) {
       onProgress(`Reading page headers (${needHeader.indexOf(p) + 1} of ${needHeader.length})…`,
                  span[1] - (span[1] - span[0]) * 0.04);
       const full = await renderForOcr(doc, p, scale);
-      let found = null;
+      const reads = [];
       for (const invert of [false, true]) {
         const strip = headerStrip(full, invert);
         const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
         strip.width = strip.height = 1;
-        if (HEADER_ITEM.test(data.text)) { found = data; break; }
+        if (HEADER_ITEM.test(data.text)) { reads.push({ data, f: 2, x0: 0, y0: 0, h: full.height }); break; }
+      }
+      // A header bar's words run together and its digits blur into the "of"
+      // (see HEADER_ITEM), and each enlargement misreads a different page, so
+      // the bar is read at three sizes and every reading is kept; the page
+      // sequence picks between them once all pages are in.
+      for (const k of reads.length ? [] : [0.8, 1.1, 1.5]) {
+        const strip = headerBar(full, k);
+        if (!strip) break;
+        const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
+        const x0 = strip.x0, y0 = strip.y0, f = strip.f;
+        strip.width = strip.height = 1;
+        if (HEADER_ITEM.test(data.text)) reads.push({ data, f, x0, y0, h: 1e9 });
       }
       full.width = full.height = 1;
-      if (!found) { stats.noHeader.push(p); continue; }
+      if (reads.length) barReads.push({ p, reads });
+      else stats.noHeader.push(p);
+    }
+    for (const { p, data, f, x0, y0, h, num, total } of settleBarHeaders(barReads, pages, n)) {
       const rec = pages.get(p);
-      const strip = ocrPageRecord(found, scale * 2, full.height, null);
-      // the strip is the page's own top, at twice the scale: its coordinates
-      // already divide back to the same points as the rest of the page
+      const strip = ocrPageRecord(data, scale * f, h, null);
+      // the strip is the page's own top, enlarged: its coordinates already
+      // divide back to the same points as the rest of the page, once a bar
+      // cut from further down is put back where it was
+      for (const L of strip.L) {
+        L.b = +(L.b + y0 / scale).toFixed(2);
+        for (const w of L.w) {
+          w[0] = +(w[0] + x0 / scale).toFixed(2);
+          w[1] = +(w[1] + x0 / scale).toFixed(2);
+        }
+      }
+      // The header is restated as the number settled on whenever the words
+      // kept for the page do not already say it: the sequence may have
+      // overruled the reading, or the fused "item2of50" was dropped as a
+      // low-confidence word.
+      const own = (strip.L.map((L) => L.w.map((w) => w[2]).join(" ")).join("\n")
+        .match(HEADER_ITEM) || [])[1];
+      if (own === undefined || parseInt(own, 10) !== num) {
+        for (const L of strip.L) {
+          L.w = L.w.filter((w) => !/tem|Question/.test(w[2]) && !HEADER_ITEM.test(w[2]));
+        }
+        strip.L = strip.L.filter((L) => L.w.length);
+        strip.L.push(headerLine(data, scale * f, x0 / scale, y0 / scale, `Item ${num} of ${total}`));
+      }
       rec.L = strip.L.concat(rec.L).sort((a, b) => a.b - b.b);
       pages.set(p, rec);
       stats.headerFallback++;
@@ -1866,6 +1975,140 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
   }
   onProgress(`${label} — done`, span[1]);
   return { pages, stats };
+}
+
+/* A one-word line restating a page's header, placed where tesseract saw the
+   header's first word (PDF points). */
+function headerLine(data, k, dx, dy, text) {
+  let hit = null;
+  for (const b of data.blocks || []) {
+    for (const p of b.paragraphs || []) {
+      for (const l of p.lines || []) {
+        for (const w of l.words || []) {
+          if (!hit && /tem|Question/.test(w.text)) hit = w.bbox;
+        }
+      }
+    }
+  }
+  const bb = hit || { x0: 0, x1: 100, y0: 0, y1: 20 };
+  const fs = (bb.y1 - bb.y0) / k;
+  return { b: +(bb.y1 / k + dy).toFixed(2), f: +fs.toFixed(2),
+           w: [[+(bb.x0 / k + dx).toFixed(2), +(bb.x1 / k + dx).toFixed(2), text]] };
+}
+
+/* Pick each bar-read page's item number. Every reading of a page offers its
+   number, plus that number less a trailing zero when the digits run straight
+   into the "of" ("item20of50" for "Item 2 of 50": the o is read twice, once
+   as a 0). Pages come in item order -- one or more shots per item -- so the
+   right candidate is the one that equals or follows the last page's number;
+   failing that, the one the readings agree on most, never beyond the total.
+   Pages whose own text named their item anchor the sequence. */
+function settleBarHeaders(barReads, pages, n) {
+  if (!barReads.length) return [];
+  const byPage = new Map(barReads.map((r) => [r.p, r]));
+  const out = [];
+  let prev = null;
+  for (let p = 1; p <= n; p++) {
+    const br = byPage.get(p);
+    if (!br) {
+      const rec = pages.get(p);
+      const t = rec ? rec.L.map((L) => L.w.map((w) => w[2]).join(" ")).join("\n") : "";
+      const m = t.match(HEADER_ITEM);
+      if (m) prev = parseInt(m[1], 10);
+      continue;
+    }
+    const votes = new Map();
+    let total = null;
+    for (const { data } of br.reads) {
+      const t = data.text;
+      const m = t.match(HEADER_ITEM);
+      const k = parseInt(m[1], 10);
+      const tm = t.slice(m.index + m[0].length).match(/^\s*(\d+)/);
+      if (tm && (!total || +tm[1] < total)) total = +tm[1];
+      const cands = [k];
+      if (k >= 10 && k % 10 === 0 && /\d0[Oo]f/.test(m[0])) cands.push(k / 10);
+      cands.forEach((c, i) => votes.set(c, (votes.get(c) || 0) + (i ? 0.9 : 1)));
+    }
+    let ok = [...votes.keys()].filter((c) => c >= 1 && (!total || c <= total));
+    if (!ok.length) continue;
+    let num = null;
+    if (prev !== null) {
+      const next = ok.filter((c) => c === prev || c === prev + 1);
+      if (next.length) num = next.sort((a, b) => votes.get(b) - votes.get(a))[0];
+    }
+    if (num === null) num = ok.sort((a, b) => votes.get(b) - votes.get(a))[0];
+    prev = num;
+    const r = br.reads[0];
+    out.push({ ...r, p, num, total: total || "" });
+  }
+  return out;
+}
+
+/* The newer NBME client prints "Item 2 of 50" in white inside a blue bar
+   that sits below a strip of white page and beside the question-status rail
+   (Internal Medicine 10). Whole-page recognition reads nothing there, and the
+   plain header strip mixes the white margin with the bar, so neither polarity
+   suits it: 53 of 57 question pages lost their number. Cut out just the bar --
+   the first band of dark rows near the top -- and read it inverted, as dark
+   text on light. `x0`/`y0` is where the bar starts, in the canvas's own
+   pixels, and `f` how much it was enlarged. */
+function headerBar(canvas, k) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const H = Math.round(canvas.height * 0.25), W = canvas.width;
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const dark = (y) => {
+    let n = 0, k = 0;
+    for (let x = Math.round(W * 0.15); x < W * 0.85; x += 4, k++) {
+      if (d[(y * W + x) * 4] < 140) n++;
+    }
+    return n / k > 0.6;
+  };
+  let y0 = 0;
+  while (y0 < H && !dark(y0)) y0++;
+  let y1 = y0;
+  while (y1 < H && dark(y1)) y1++;
+  if (y1 - y0 < canvas.height * 0.02) return null;
+  // Only the bar's own columns: a question-status rail beside it prints
+  // dark-on-light ("Question Status" on Pediatrics 9), and once inverted
+  // that block garbled the header on the same text line.
+  const colDark = (x) => {
+    let n = 0;
+    for (let y = y0; y < y1; y++) if (d[(y * W + x) * 4] < 140) n++;
+    return n / (y1 - y0) > 0.5;
+  };
+  // the widest run of bar-coloured columns, stepping over the thin light
+  // rules inside it (the box around "Item: 2 of 50")
+  let x0 = 0, x1 = W, best = 0, from = -1, last = -1;
+  for (let x = 0; x <= W; x++) {
+    if (x < W && colDark(x)) {
+      if (from < 0 || x - last > W * 0.01) from = x;
+      last = x;
+      if (last - from > best) { best = last - from; x0 = from; x1 = last + 1; }
+    }
+  }
+  if (best < W * 0.5) { x0 = 0; x1 = W; }
+  y0 = Math.max(0, y0 - 2); y1 = Math.min(H, y1 + 2);
+  // Tesseract reads text best at a few dozen pixels high, and bars come in
+  // every size (Internal Medicine 10's is 115 rows at OCR scale, Pediatrics
+  // 9's 245), so the enlargement is set from the bar's own height; `k` asks
+  // for a little more or less of it.
+  const f = Math.max(0.5, Math.min(6, k * 300 / (y1 - y0)));
+  const c = document.createElement("canvas");
+  c.width = (x1 - x0) * f;
+  c.height = (y1 - y0) * f;
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  cx.imageSmoothingQuality = "high";
+  cx.drawImage(canvas, x0, y0, x1 - x0, y1 - y0, 0, 0, c.width, c.height);
+  const im = cx.getImageData(0, 0, c.width, c.height);
+  const e = im.data;
+  for (let i = 0; i < e.length; i += 4) {
+    e[i] = 255 - e[i]; e[i + 1] = 255 - e[i + 1]; e[i + 2] = 255 - e[i + 2];
+  }
+  cx.putImageData(im, 0, 0);
+  c.x0 = x0;
+  c.y0 = y0;
+  c.f = f;
+  return c;
 }
 
 function headerStrip(canvas, invert) {
@@ -1914,26 +2157,127 @@ function ocrWords(rec, viewport) {
   return raw;
 }
 
+/* The newer NBME client runs a "Question Status" rail down the left edge of
+   the window: one row per item, numbered 1, 2, 3… with a bullet, a flag or a
+   tick in front (Internal Medicine 10, Pediatrics 9). OCR reads those numbers
+   as words, and every one that shares a baseline with a stem line joins it,
+   so "has Alzheimer disease" came back as "15 has Alzheimer disease", stems
+   and keys stopped matching, and the rail's shading and flags were cut out as
+   figures. The rail is recognised by what it is -- a narrow column at the far
+   left of short numbers that mostly count upwards, evenly spaced -- and
+   everything in it is dropped. `edge` (PDF points) is where the item's own
+   content begins, so the page image can be blanked up to it too.
+
+   Coordinates are the cached record's own (PDF points), and this runs as the
+   record is served rather than when it is recognised, so pages already in the
+   OCR cache are cleaned without being read again. */
+function stripStatusRail(rec, pageW) {
+  const none = { rec, edge: 0 };
+  if (!rec || !rec.L.length) return none;
+  const nums = [];
+  for (const L of rec.L) {
+    for (const w of L.w) {
+      if (w[0] > pageW * 0.12) break;
+      const m = w[2].match(/^[^A-Za-z0-9]{0,2}(\d{1,3})[.,]?$/);
+      if (m) { nums.push({ b: L.b, f: L.f, x0: w[0], x1: w[1], n: +m[1] }); break; }
+    }
+  }
+  if (nums.length < 8) return none;
+  // one column: the numbers line up within a couple of characters
+  const mx = median(nums.map((t) => t.x0));
+  const f = median(nums.map((t) => t.f));
+  const col = nums.filter((t) => Math.abs(t.x0 - mx) <= f * 2).sort((a, b) => a.b - b.b);
+  if (col.length < 8) return none;
+  // OCR misreads a few of the numbers and catches the odd stray digit, so
+  // ask only that most of them count upwards down the page: the longest
+  // increasing run (not necessarily contiguous) must hold 60 percent of them
+  const len = col.map(() => 1), prevI = col.map(() => -1);
+  for (let i = 1; i < col.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (col[j].n < col[i].n && len[j] + 1 > len[i]) { len[i] = len[j] + 1; prevI[i] = j; }
+    }
+  }
+  let end = 0;
+  for (let i = 1; i < col.length; i++) if (len[i] > len[end]) end = i;
+  if (len[end] < Math.max(8, col.length * 0.6)) return none;
+  const run = [];
+  for (let i = end; i >= 0; i = prevI[i]) run.unshift(col[i]);
+  const steps = [];
+  for (let i = 1; i < run.length; i++) {
+    steps.push((run[i].b - run[i - 1].b) / (run[i].n - run[i - 1].n));
+  }
+  // evenly spaced: most rows sit one rail pitch apart
+  const pitch = median(steps);
+  const even = steps.filter((s) => Math.abs(s - pitch) <= pitch * 0.35).length;
+  if (pitch <= 0 || even < steps.length * 0.5) return none;
+
+  const railX1 = Math.max(...col.map((t) => t.x1));
+  // the item's own left margin: the first real word right of the rail
+  let left = Infinity;
+  for (const L of rec.L) {
+    for (const w of L.w) {
+      if (w[0] > railX1 + f * 0.5 && /[A-Za-z]{3,}/.test(w[2])) left = Math.min(left, w[0]);
+    }
+  }
+  if (!isFinite(left)) return none;
+  const cut = Math.min(left - f * 0.3, railX1 + f * 3);
+  const L2 = [];
+  for (const L of rec.L) {
+    const w = L.w.filter((t) => !(t[0] < cut && t[1] < left - f * 0.3));
+    if (w.length) L2.push({ ...L, w });
+  }
+  return { rec: { ...rec, L: L2 }, edge: Math.min(left - f * 0.5, railX1 + f * 6) };
+}
+
 /* One accessor for a document's text, whether it has a text layer or was
    recognized. Everything in parseExam goes through this, so the OCR path and
    the text path are the same code from here on. */
 function makeSource(doc, ocrPages) {
+  const railed = new Map();
+  async function ocrPage(p) {
+    if (!railed.has(p)) {
+      const page = await doc.getPage(p);
+      railed.set(p, stripStatusRail(ocrPages.get(p), page.getViewport({ scale: 1 }).width));
+    }
+    return railed.get(p);
+  }
   return {
     doc,
     numPages: doc.numPages,
     ocr: !!ocrPages,
     async lines(p, foldSubscripts) {
-      if (ocrPages) return ocrLines(ocrPages.get(p));
+      if (ocrPages) return ocrLines((await ocrPage(p)).rec);
       return getPageLines(await doc.getPage(p), foldSubscripts);
     },
     async text(p) {
       return (await this.lines(p)).map((l) => l.text).join("\n");
     },
     async words(p, viewport) {
-      if (ocrPages) return ocrWords(ocrPages.get(p), viewport);
+      if (ocrPages) return ocrWords((await ocrPage(p)).rec, viewport);
       return getPageWords(await doc.getPage(p), viewport);
     },
+    // where the content starts right of a question-status rail, in PDF
+    // points (0 when the page has none)
+    async railEdge(p) {
+      return ocrPages ? (await ocrPage(p)).edge : 0;
+    },
   };
+}
+
+/* Blank the question-status rail out of a rendered page (see
+   stripStatusRail), so its shading, flags and the scrollbar beside it are
+   never taken for an exhibit or a radio circle. Only the copy the parser
+   measures is touched; the page image shown to the reader keeps it. */
+function blankRail(im, edgePx, top, bottom) {
+  const x1 = Math.min(im.width, Math.round(edgePx));
+  if (x1 <= 0) return;
+  const d = im.data;
+  for (let y = Math.max(0, top); y < Math.min(im.height, bottom); y++) {
+    for (let x = 0; x < x1; x++) {
+      const i = (y * im.width + x) * 4;
+      d[i] = d[i + 1] = d[i + 2] = 255;
+    }
+  }
 }
 
 /* ---------------- main ------------------------------------------------- */
@@ -2064,6 +2408,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     prog(`Preparing question ${gi + 1} of ${qGroups.length}…`,
          0.3 + gi / qGroups.length * 0.7);
     const shots = [];
+    let railPx = 0;
     for (const p of group) {
       const page = await qdoc.getPage(p);
       const viewport = page.getViewport({ scale: SCALE });
@@ -2075,12 +2420,16 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       const im = cx.getImageData(0, 0, w, h);
       const band = contentBand(im.data, w, h);
       if (band[0] === 0 && band[1] === h) bandFallback.questions.push(p);
+      const rail = (await qSrc.railEdge(p)) * SCALE;
+      railPx = Math.max(railPx, rail);
+      blankRail(im, rail, 0, h);
       shots.push({ canvas: c, img: im, w, h, band,
                    words: await qSrc.words(p, viewport) });
     }
     const st = stitchShots(shots);
+    if (shots.length > 1) blankRail(st.img, railPx, 0, st.h);
     const canvas = st.canvas, img = st.img, rawWords = tidyChoiceWords(st.words);
-    const top = st.top, bottom = st.bottom;
+    const top = belowMarkLine(rawWords, st.top, st.bottom), bottom = st.bottom;
     const w = st.w, h = st.h;
     const cw = st.w, ch = bottom - top;
     const itemText = group.length === 1 ? qTexts[pno - 1] : textFromWords(rawWords);
