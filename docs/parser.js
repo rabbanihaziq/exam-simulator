@@ -34,10 +34,25 @@ function normText(s) {
 }
 
 function stemKey(text) {
-  // the answer key prints a red X before a wrongly answered item's number
-  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*[.)]\s/, " ");
-  t = t.split(/\n\s*[A-Z]\)|C[oa]rrect\s*Answer/)[0];
-  return normText(t).slice(0, 350);
+  // the answer key prints a red X before a wrongly answered item's number.
+  // "27." may stand alone on its line, but "N)" may not: a form that prints
+  // no stem number would otherwise lose its whole vignette to a wrapped lab
+  // value lower down ("(N=160-\n950)" on Internal Medicine 9 item 27, which
+  // then matched no answer page).
+  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*(?:\.\s|\)[^\S\n])/, " ");
+  // The stem ends at the choices: at the first line-initial label whose next
+  // letter also opens a line further down. A lone label is chrome, not a
+  // choice list -- Psychiatry 8's capture prints its Mark button as
+  // "O) Mark" above the vignette, and every stem key came out as chrome.
+  let cut = t.search(/C[oa]rrect\s*Answer/);
+  if (cut < 0) cut = t.length;
+  const labels = [...t.matchAll(/\n\s*([A-Z])\)/g)];
+  for (const m of labels) {
+    if (m.index >= cut) break;
+    const next = String.fromCharCode(m[1].charCodeAt(0) + 1);
+    if (labels.some((o) => o.index > m.index && o[1] === next)) { cut = m.index; break; }
+  }
+  return normText(t.slice(0, cut)).slice(0, 350);
 }
 
 /* Two share formats, two page headers: the NBME client prints
@@ -75,9 +90,34 @@ function itemNumber(text) {
    "Correct" and once by the plural "Answers" — and must take a letter that
    stands alone, never the initial of the next word. Written without a
    lookbehind so older Safari still parses this file. */
-// "Carrect": OCR's reading of Surgery Form 9 item 7's key line.
+// "Carrect": OCR's reading of Surgery Form 9 item 7's key line. OCR can also
+// drop the C outright and read the colon as a semicolon ("orrect Answer; B."
+// on Psychiatry 7 item 30), and Pediatrics 5 item 1 prints "Correct Answers:
+// D." -- a plural is taken only when a single letter follows it, never a list.
 const CORRECT_ANSWER =
-  /(?:^|[^A-Za-z])C[oa]rrect\s*Answer(?!s)\s*[:.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])/;
+  /(?:^|[^A-Za-z])C?[oa]rrect\s*Answer(?:s(?=\s*[:;.]?\s*[A-Z](?![A-Za-z])(?!\s*(?:,|and\b|&))))?(?!s)\s*[:;.\u2013\u2014-]?\s*([A-Z])(?![A-Za-z])/;
+
+/* "Incorrect Answers: A, B, C, and E." -- every choice but the right one.
+   When OCR loses the "Correct Answer" line (it can sit on the seam between
+   two screenshots) this line still pins the answer down, provided the item's
+   own choices leave exactly one letter it does not list. */
+const INCORRECT_LIST = /[Il1]ncorrect\s*Answers?\s*[:;.]?\s*([A-Z](?:\s*(?:,|and\b|&)\s*(?:and\s+)?[A-Z](?![A-Za-z]))+)/;
+
+function incorrectLetters(text) {
+  const m = text.match(INCORRECT_LIST);
+  return m ? new Set(m[1].match(/[A-Z](?![A-Za-z])/g)) : null;
+}
+
+/* An answer page's item number when the number is printed after the key's
+   right/wrong marker ("Vv 30. A 37-year-old man..."), which keeps it from
+   opening its line the way itemNumber expects. Same rule as itemNumber: it
+   must sit above choice A. */
+function markedItemNumber(text) {
+  const m = text.match(/(?:^|\n)[^\S\n]*[Xx\u00d7*\u2713\u221aVv]{1,2}[^\S\n]+(\d{1,3})\s*[.)]\s+[A-Z(]/);
+  if (!m) return null;
+  const c = text.match(FIRST_CHOICE);
+  return !c || m.index < c.index ? parseInt(m[1], 10) : null;
+}
 
 function correctLetter(text) {
   const m = text.match(CORRECT_ANSWER);
@@ -2211,12 +2251,47 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   const groupLetter = new Map();
   // "group:letter" -> the line the letter was read from, shown with the key
   const keySource = new Map();
+  const pageNum = aTexts.map((t) => itemNumber(t) ?? markedItemNumber(t));
+  const pageLetter = aTexts.map((t) => correctLetter(t));
+  const letteredNums = new Set(pageNum.filter((n, i) => n !== null && pageLetter[i]));
+  /* A key page whose header OCR could not read, and that prints no stem
+     number either, is one shot of an item captured in several. It belongs to
+     the numbered page beside it -- before it if that item has no letter
+     anywhere in the key, else after it on the same terms (Psychiatry 6 item
+     26 has its letter on such a shot after the stem; Family Medicine 5 item
+     33, on one before it). An item that already has a letter claims nothing. */
+  function keyPageNumber(pno) {
+    const i = pno - 1;
+    if (pageNum[i] !== null) return pageNum[i];
+    // a run of such shots between items n and n + 2, with no page numbered
+    // n + 1 anywhere, is item n + 1 (Family Medicine 5 item 17)
+    let a = i - 1, b = i + 1;
+    while (a >= 0 && pageNum[a] === null) a--;
+    while (b < pageNum.length && pageNum[b] === null) b++;
+    if (a >= 0 && b < pageNum.length && pageNum[b] - pageNum[a] === 2 &&
+        !pageNum.includes(pageNum[a] + 1)) return pageNum[a] + 1;
+    for (const j of [i - 1, i + 1]) {
+      if (j < 0 || j >= pageNum.length || pageNum[j] === null) continue;
+      if (!letteredNums.has(pageNum[j])) return pageNum[j];
+    }
+    return null;
+  }
+  // pages that print only the "Incorrect Answers" list, by item number
+  const exclPages = [], exclByItem = new Map();
   aGroups.forEach((group, gi) => {
     for (const pno of group) {
       const text = aTexts[pno - 1];
-      const letter = correctLetter(text);
-      if (!letter) continue;   // continuation shot with no answer marker
-      const cand = { group: gi, num: itemNumber(text), letter, key: stemKey(text) };
+      const letter = pageLetter[pno - 1];
+      if (!letter) {               // continuation shot with no answer marker
+        const excl = incorrectLetters(text);
+        if (!excl) continue;
+        const ex = { group: gi, excl, num: keyPageNumber(pno), key: stemKey(text),
+                     src: text.match(INCORRECT_LIST)[0].replace(/\s+/g, " ") };
+        exclPages.push(ex);
+        if (ex.num !== null && !exclByItem.has(ex.num)) exclByItem.set(ex.num, ex);
+        continue;
+      }
+      const cand = { group: gi, num: keyPageNumber(pno), letter, key: stemKey(text) };
       answerPages.push(cand);
       if (!keySource.has(`${gi}:${letter}`)) keySource.set(`${gi}:${letter}`, keyLine(text));
       if (!groupLetter.has(gi)) groupLetter.set(gi, letter);
@@ -2318,7 +2393,21 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       return [writtenGroup(k.page), letter, src];
     }
     const [g, letter] = resolveAnswer(itemNo, qStem, gi, nq);
-    return [g, letter, g === null ? null : (keySource.get(`${g}:${letter}`) || null)];
+    if (g !== null) return [g, letter, keySource.get(`${g}:${letter}`) || null];
+    // no key line for this item anywhere: the one choice its key page does
+    // not list as incorrect, if there is exactly one
+    let ex = exclByItem.get(itemNo), best = 0.75;
+    if (!ex) {
+      for (const p of exclPages) {
+        const r = similarity(qStem, p.key);
+        if (r >= best) { best = r; ex = p; }
+      }
+    }
+    const left = ex ? choices.map((c) => c.letter).filter((L) => !ex.excl.has(L)) : [];
+    if (left.length === 1 && [...ex.excl].every((L) => choices.some((c) => c.letter === L))) {
+      return [ex.group, left[0], `${ex.src}  [${left[0]}: the one choice not listed]`];
+    }
+    return [null, null, null];
   }
 
   /* -- parse question pages -- */
