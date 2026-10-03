@@ -607,6 +607,38 @@ function stemBelowChoices(raw, ordered, bottom) {
   return null;
 }
 
+/* The newer NBME client draws the answer choices inside a ruled box
+   (Pediatrics 9, Psychiatry 8, Surgery 9). Its top rule sits between the stem
+   and choice A, inside the band scanned for exhibits, so the rule and the
+   stubs of the box's sides became a "figure" that extendFiguresBelow then
+   followed down the box's edge; every word of choice A fell inside it and the
+   item dropped to image mode. When a long horizontal rule crosses the rows
+   just above the first choice, starting left of the choice labels, the stem
+   band ends above it. Returns the row the stem band ends at. */
+function choiceFrameTop(imgData, pxChoices, stemBot) {
+  const data = imgData.data, W = imgData.width;
+  // the rule starts left of the labels; the radio circles are too faint on
+  // some captures to be found, so their guessed position is no guide
+  const left = Math.min(...pxChoices.map((c) => c.lx0));
+  const lh = median(pxChoices.map((c) => c.lw.y1 - c.lw.y0)) || 20;
+  // as wide as its longest choice, which can be short
+  const minRun = W * 0.08;
+  for (let y = Math.floor(stemBot); y > stemBot - lh * 1.5 && y > 0; y--) {
+    let run = 0, start = -1, best = 0, bestStart = -1;
+    for (let x = Math.max(0, Math.floor(left - lh * 3)); x < W; x++) {
+      const i = (y * W + x) * 4;
+      const d = Math.max(255 - data[i], 255 - data[i + 1], 255 - data[i + 2]);
+      if (d > 40) {
+        if (!run) start = x;
+        run++;
+        if (run > best) { best = run; bestStart = start; }
+      } else run = 0;
+    }
+    if (best >= minRun && bestStart <= left) return y - 2;
+  }
+  return stemBot;
+}
+
 /* Build the structured content for one question page: stem paragraphs with
    inline figure crops, plus per-choice text runs. Returns null when the page
    doesn't extract cleanly (caller falls back to image mode). */
@@ -615,7 +647,9 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
   if (!pxChoices.length) return null;
   // The topmost choice, not choice A: with the choices in two columns the
   // right column's first label can sit a few pixels above A's.
-  const stemBot = Math.min(...pxChoices.map((c) => c.rowTop));
+  // ...and above the frame the choices are boxed in, where there is one.
+  const stemBot = choiceFrameTop(imgData,
+    pxChoices, Math.min(...pxChoices.map((c) => c.rowTop)));
   // The stem ends at the first choice's BASELINE, not at the top of its box.
   // A word's box is y0 = baseline - fontSize, y1 = baseline + 0.25*fontSize,
   // so a last stem line only a line and a half above choice A failed
