@@ -1285,10 +1285,26 @@ function textFromWords(words) {
     .map((w) => w.text).join(" ")).join("\n");
 }
 
+/* offsetFromText measures page rows, the stitch works in content-band rows:
+   the same thing only when both shots found their band at the same height,
+   which a capture with no chrome bars (where the band falls back to the
+   whole page in one shot and not the next) does not. */
+function bandOffset(a, b) {
+  const d0 = offsetFromText(buildAnchors(a.words, a.band[0], a.band[1]),
+                            buildAnchors(b.words, b.band[0], b.band[1]));
+  return d0 === null ? null : d0 - a.band[0] + b.band[0];
+}
+
 /* Paint an item's shots into one tall canvas and merge their words without
    duplicating the overlap. A single shot is returned untouched, so forms with
-   one page per item take exactly the path they always did. */
-function stitchShots(shots) {
+   one page per item take exactly the path they always did.
+
+   `known` optionally gives the offset of each shot below the one before,
+   null meaning "no overlap". Without it the offset is found here; shots with
+   no text to align on are stacked one below the other. Stitching never fails a parse: Pediatrics Forms 7 and 8 capture a
+   CT image in one shot and the vignette in the next with no line in common,
+   and this used to throw and take the whole exam down with it. */
+function stitchShots(shots, known) {
   if (shots.length === 1) {
     const s = shots[0];
     return { canvas: s.canvas, img: s.img, words: s.words,
@@ -1297,17 +1313,21 @@ function stitchShots(shots) {
   const offsets = [];
   for (let i = 1; i < shots.length; i++) {
     const a = shots[i - 1], b = shots[i];
-    const d0 = offsetFromText(buildAnchors(a.words, a.band[0], a.band[1]),
-                              buildAnchors(b.words, b.band[0], b.band[1]));
-    if (d0 === null) {
-      throw new Error("pages carry the same item number but share no text to align on");
+    let d = known ? known[i - 1] : undefined;
+    if (d === undefined) {
+      const d0 = bandOffset(a, b);
+      d = d0 === null ? null : a.w !== b.w ? Math.round(d0)
+        : refineOffset(a.img.data, b.img.data, a.w, a.band, b.band, d0);
     }
-    offsets.push(refineOffset(a.img.data, b.img.data, a.w, a.band, b.band, d0));
+    // nothing in common: B starts where A's content ends
+    offsets.push(d === null ? a.band[1] - a.band[0] : d);
   }
   const starts = [0];
   offsets.forEach((d) => starts.push(starts[starts.length - 1] + d));
   const seams = [];
   for (let i = 0; i < shots.length - 1; i++) {
+    // shots of different widths cannot be compared row by row: cut where B starts
+    if (shots[i].w !== shots[i + 1].w) { seams.push(starts[i] + Math.max(0, offsets[i])); continue; }
     seams.push(starts[i] + seamRow(shots[i].img.data, shots[i + 1].img.data,
                                    shots[i].w, shots[i].band, shots[i + 1].band,
                                    offsets[i]));
@@ -2078,7 +2098,12 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       shots.push({ canvas: c, img: im, w, h, band,
                    words: await qSrc.words(p, viewport) });
     }
-    const st = stitchShots(shots);
+    let st;
+    try {
+      st = stitchShots(shots);
+    } catch (e) {
+      st = stitchShots([shots[0]]);    // never lose the exam over one item's layout
+    }
     const canvas = st.canvas, img = st.img, rawWords = tidyChoiceWords(st.words);
     const top = st.top, bottom = st.bottom;
     const w = st.w, h = st.h;
@@ -2273,8 +2298,10 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       shots.push({ canvas: c, img: im, w: c.width, h: c.height, band,
                    words: await aSrc.words(p, viewport) });
     }
+    let st;
+    try { st = stitchShots(shots); } catch (e) { st = stitchShots([shots[0]]); }
     const url = await new Promise((res) =>
-      stitchShots(shots).canvas.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
+      st.canvas.toBlob((b) => res(URL.createObjectURL(b)), "image/png"));
     aCache.set(it.a_group, url);
     return url;
   }
