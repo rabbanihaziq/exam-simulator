@@ -40,11 +40,11 @@ function normText(s) {
 
 function stemKey(text) {
   // the answer key prints a red X before a wrongly answered item's number.
-  // "27." may stand alone on its line, but "N)" may not: a form that prints
-  // no stem number would otherwise lose its whole vignette to a wrapped lab
-  // value lower down ("(N=160-\n950)" on Internal Medicine 9 item 27, which
-  // then matched no answer page).
-  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*(?:\.\s|\)[^\S\n])/, " ");
+  // "27." may stand alone on its line, but "N)" may not, and needs text after
+  // it on its line: a form that prints no stem number would otherwise lose
+  // its whole vignette to a wrapped lab value lower down ("(N=160-\n950)" on
+  // Internal Medicine 9 item 27, which then matched no answer page).
+  let t = text.replace(/^[\s\S]*?\n[^\S\n]*(?:[Xx\u00d7*\u2713\u221a]\s*)?\d+\s*(?:\.\s|\)[^\S\n]+(?=\S))/, " ");
   // The stem ends at the choices: at the first line-initial label whose next
   // letter also opens a line further down. A lone label is chrome, not a
   // choice list -- Psychiatry 8's capture prints its Mark button as
@@ -63,8 +63,16 @@ function stemKey(text) {
 /* Two share formats, two page headers: the NBME client prints
    "Exam Section : Item 7 of 50", the app the ObGyn forms come from prints
    "Question 7 Of 50 (03:41)". Either one names the item the page belongs to.
-   The space can be lost by OCR ("Question 35Of Of 50"), so it is optional. */
-const HEADER_ITEM = /(?:Item|Question)\s*(\d+)\s*[Oo]f\b/;
+   The space can be lost by OCR ("Question 35Of Of 50"), so it is optional.
+   The newer NBME client boxes it as "Item: 2 of 50" over "Block: 2 of 2",
+   with a colon (Pediatrics 9, Psychiatry 8).
+   Read off a coloured bar (Internal Medicine 10) the words run together and
+   the capital goes astray: "item2of50", "ttem3of50", "item10f50" for
+   "Item 1 of 50". So the I may be lower case or a t, the "of" may read "0f"
+   and need no space either side, and the number is the shortest run of
+   digits that still leaves an "of" behind it -- "10f50" is item 1, while a
+   clean "10 of 50" or a fused "20of50" still reads 10 and 20. */
+const HEADER_ITEM = /(?:Item|Question|\b[Iil1t]tem)\s*:?\s*(\d+?)\s*[Oo0]f(?![a-z])/;
 
 /* Without a header, a page may still print its number on a line of its own
    ("27." above the NBME chrome on Surgery Form 2). That number always sits
@@ -178,7 +186,8 @@ function contentBand(data, w, h) {
   let top = 0, bottom = h;
   const topBand = dark.filter((y) => y < h * 0.22);
   const botBand = dark.filter((y) => y > h * 0.78);
-  if (topBand.length) top = Math.max(...topBand) + 1;
+  if (topBand.length) top = barEnd(dark, Math.max(...topBand), h) + 1;
+  else if (dark.length) top = pastedHeader(data, w, h, dark);
   if (botBand.length) bottom = Math.min(...botBand);
   else if (dark.length) {
     // A capture pasted onto a larger sheet leaves white below it, so the
@@ -229,6 +238,44 @@ function contentBand(data, w, h) {
   }
   if (bottom - top < h * 0.3) return [0, h];
   return [top, bottom];
+}
+
+/* The last row of the navy run that `from` belongs to. A header bar that
+   straddles the 0.22 cut (Psychiatry 8 page 6 runs from 0.19 to 0.26 of the
+   page) used to end at the cut, leaving the bottom half of the bar and its
+   labels in the content. */
+function barEnd(dark, from, h) {
+  const isDark = new Set(dark);
+  let end = from;
+  while (end < h * 0.5 && (isDark.has(end + 1) || isDark.has(end + 2))) {
+    end += isDark.has(end + 1) ? 1 : 2;
+  }
+  return end;
+}
+
+/* The header bar of a capture pasted part-way down a larger sheet. Psychiatry
+   8's question pages put the screenshot a third of the way down an A4 page
+   with nothing above it, so its navy bar sits below the 0.22 cut and the
+   band fell back to the whole page; the bar and the blank sheet above it then
+   became a "figure" that was followed down through the choice box and
+   swallowed every choice (22 items to image mode). The first navy run is the
+   header when it starts in the upper half and only blank page lies above it.
+   Returns the row the content starts at, or 0. */
+function pastedHeader(data, w, h, dark) {
+  const end = barEnd(dark, dark[0], h);
+  if (dark[0] > h * 0.5 || end - dark[0] < h * 0.015) return 0;
+  // the bar's own anti-aliased edge is not page content
+  for (let y = 0; y < dark[0] - 4; y += 2) {
+    const row = y * w * 4;
+    let ink = 0, n = 0;
+    for (let x = 0; x < w; x += 3) {
+      const i = row + x * 4;
+      if (Math.min(data[i], data[i + 1], data[i + 2]) < 235) ink++;
+      n++;
+    }
+    if (ink / n > 0.02) return 0;
+  }
+  return end + 1;
 }
 
 /* Locate the radio circle left of a choice-letter box. Returns [cx,cy,r]. */
@@ -735,6 +782,38 @@ function stemBelowChoices(raw, ordered, bottom) {
   return null;
 }
 
+/* The newer NBME client draws the answer choices inside a ruled box
+   (Pediatrics 9, Psychiatry 8, Surgery 9). Its top rule sits between the stem
+   and choice A, inside the band scanned for exhibits, so the rule and the
+   stubs of the box's sides became a "figure" that extendFiguresBelow then
+   followed down the box's edge; every word of choice A fell inside it and the
+   item dropped to image mode. When a long horizontal rule crosses the rows
+   just above the first choice, starting left of the choice labels, the stem
+   band ends above it. Returns the row the stem band ends at. */
+function choiceFrameTop(imgData, pxChoices, stemBot) {
+  const data = imgData.data, W = imgData.width;
+  // the rule starts left of the labels; the radio circles are too faint on
+  // some captures to be found, so their guessed position is no guide
+  const left = Math.min(...pxChoices.map((c) => c.lx0));
+  const lh = median(pxChoices.map((c) => c.lw.y1 - c.lw.y0)) || 20;
+  // as wide as its longest choice, which can be short
+  const minRun = W * 0.08;
+  for (let y = Math.floor(stemBot); y > stemBot - lh * 1.5 && y > 0; y--) {
+    let run = 0, start = -1, best = 0, bestStart = -1;
+    for (let x = Math.max(0, Math.floor(left - lh * 3)); x < W; x++) {
+      const i = (y * W + x) * 4;
+      const d = Math.max(255 - data[i], 255 - data[i + 1], 255 - data[i + 2]);
+      if (d > 40) {
+        if (!run) start = x;
+        run++;
+        if (run > best) { best = run; bestStart = start; }
+      } else run = 0;
+    }
+    if (best >= minRun && bestStart <= left) return y - 2;
+  }
+  return stemBot;
+}
+
 /* Build the structured content for one question page: stem paragraphs with
    inline figure crops, plus per-choice text runs. Returns null when the page
    doesn't extract cleanly (caller falls back to image mode). */
@@ -743,7 +822,9 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
   if (!pxChoices.length) return null;
   // The topmost choice, not choice A: with the choices in two columns the
   // right column's first label can sit a few pixels above A's.
-  const stemBot = Math.min(...pxChoices.map((c) => c.rowTop));
+  // ...and above the frame the choices are boxed in, where there is one.
+  const stemBot = choiceFrameTop(imgData,
+    pxChoices, Math.min(...pxChoices.map((c) => c.rowTop)));
   // The stem ends at the first choice's BASELINE, not at the top of its box.
   // A word's box is y0 = baseline - fontSize, y1 = baseline + 0.25*fontSize,
   // so a last stem line only a line and a half above choice A failed
@@ -804,11 +885,18 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
     const ux1 = Math.max(a.x1, b.x1), uy1 = Math.max(a.y1, b.y1);
     const over = (f, L) => Math.max(0, Math.min(f.x1, L.x1) - Math.max(f.x0, L.x0)) *
                            Math.max(0, Math.min(f.y1, L.y1) - Math.max(f.y0, L.y0));
+    // A line of prose lying wholly between the two, across the gap, also
+    // keeps them apart however little of it the union covers: Internal
+    // Medicine 10 item 25's lab table was merged with a sliver of ink below
+    // the sentence under it, and the crop cut that sentence in half.
+    const gapTop = Math.min(a.y1, b.y1), gapBot = Math.max(a.y0, b.y0);
     return lines.some((L) => {
       if (L.inFig) return false;
       const area = Math.max(1, (L.x1 - L.x0) * (L.y1 - L.y0));
-      return over({ x0: ux0, y0: uy0, x1: ux1, y1: uy1 }, L) / area > 0.3 &&
-             !over(a, L) && !over(b, L);
+      if (over({ x0: ux0, y0: uy0, x1: ux1, y1: uy1 }, L) / area > 0.3 &&
+          !over(a, L) && !over(b, L)) return true;
+      return L.words.length >= 5 && L.y0 >= gapTop - 2 && L.y1 <= gapBot + 2 &&
+             Math.min(ux1, L.x1) - Math.max(ux0, L.x0) > 0;
     });
   }
   function mergeFigs() {
@@ -1036,6 +1124,7 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
   // word's width moves its centre up or down out of its own row, while every
   // word on a visual line shares a baseline whatever its size.
   const choices = [];
+  const labelLeft = Math.min(...pxChoices.map((c) => c.lx0));
   for (let ci = 0; ci < pxChoices.length; ci++) {
     const pc = pxChoices[ci];
     // A boundary sits a fraction of a line above the next choice's baseline:
@@ -1067,8 +1156,32 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
                                cy > f.y0 - 4 && cy < f.y1 + 4);
     });
     if (!cws.length) return null;  // image choices etc: fall back whole item
+    let cLines = clusterTextLines(cws);
+    // The last choice's band runs to the foot of the content, and on a page
+    // with no footer bar that is the foot of the sheet: a OneNote clipping
+    // (Internal Medicine 1 and 2) prints "New Section 1 Page 2" there, and it
+    // became the end of choice E. A choice's own lines follow each other
+    // closely, so stop at the first one a blank of two lines or more below.
+    // Nor does a choice's text share a line with anything left of the labels:
+    // the newer client's "Proceed to Next Item" button sits just under the
+    // choice box, starting at the stem margin, and "to Next Item" was being
+    // read as the end of the last choice (Internal Medicine 10 item 25).
+    if (pc.nextBase == null) {
+      const lh = pc.lw.y1 - pc.lw.y0;
+      let last = pc.base;
+      const kept = [];
+      for (const l of cLines) {
+        if (l.base - last > lh * 3) break;
+        if (raw.some((w) => Math.abs(w.base - l.base) <= lh * 0.5 &&
+                            w.x0 < labelLeft - lh * 0.5 && /[A-Za-z]{2,}/.test(w.text))) break;
+        kept.push(l);
+        last = l.base;
+      }
+      if (!kept.length) return null;
+      cLines = kept;
+    }
     const runs = [];
-    clusterTextLines(cws).forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
+    cLines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
     choices.push({ letter: pc.letter, runs });
   }
   return { blocks, choices };
@@ -1226,6 +1339,12 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     // pitch below the last choice: a wrapped continuation of that choice opens
     // there too, but sits about half a pitch under the line above it, so the
     // gap to the nearest line above is what tells the two apart.
+    const misread = misreadLabel(raw, prev, L, pitch, bottom);
+    if (misread) {
+      ordered.push([L, { ...misread, relabelled: true, src: misread }]);
+      code++;
+      continue;
+    }
     const orphan = boxes.size >= 2 && orphanRow(raw, [...boxes], prev, pitch, bottom);
     if (!orphan) break;
     ordered.push([L, { x0: prev.x0, x1: prev.x1,
@@ -1252,6 +1371,30 @@ function runStart(aList, cands) {
                           Math.abs(b.x0 - a.x0) <= lh * 2)) return a;
   }
   return aList[0];
+}
+
+/* A label OCR read with the wrong punctuation: "FE" or "FE." for "F." on
+   Internal Medicine 9 (items 4, 19, 36), whose capture app sets the dot tight
+   against the letter. Without it the run stopped at E and the last choice
+   ("Cystoscopy") was read as the tail of E's text. The token must start with
+   the letter the run is waiting for, followed by at most two characters that
+   are not lower-case (so "For" opening a vignette never qualifies), sit in the label
+   column, one row pitch below the last choice, with the choice's text after
+   it on the same line. */
+function misreadLabel(raw, prev, L, pitch, bottom) {
+  const lh = prev.y1 - prev.y0;
+  const rx = new RegExp("^" + L + "[^a-z\\s]{0,2}$");
+  for (const wd of raw) {
+    if (!rx.test(wd.text) || wd.y1 > bottom) continue;
+    if (Math.abs(wd.x0 - prev.x0) > lh * 0.6) continue;
+    if (Math.abs(wd.base - prev.base - pitch) > pitch * 0.35) continue;
+    const tol = (wd.y1 - wd.y0) * 0.5;
+    const after = raw.some((o) => o !== wd && Math.abs(o.base - wd.base) <= tol &&
+                                  o.x0 >= wd.x1 - 1 && o.x0 - wd.x1 < lh * 1.5 &&
+                                  /[A-Za-z0-9]/.test(o.text));
+    if (after) return wd;
+  }
+  return null;
 }
 
 /* The first word of a choice whose label OCR lost: it opens where the other
@@ -1351,6 +1494,27 @@ function tidyChoiceWords(raw) {
   return res;
 }
 
+/* The newer NBME client puts its "Mark Question" checkbox (a flag icon and
+   the two words) on a line of its own at the top of the content, under the
+   header bar rather than in it (Pediatrics 9, Psychiatry 8), so it opened
+   every stem as "Mark Question A 13-year-old boy…" and its flag was cropped
+   as an exhibit. When the first line of the content is exactly that, the
+   content starts below it. */
+function belowMarkLine(raw, top, bottom) {
+  const ws = raw.filter((w) => w.y0 >= top - 2 && w.y1 <= bottom);
+  if (!ws.length) return top;
+  const first = ws.reduce((a, b) => (b.base < a.base ? b : a));
+  const lh = first.y1 - first.y0;
+  const line = ws.filter((w) => Math.abs(w.base - first.base) <= lh * 0.5)
+    .sort((a, b) => a.x0 - b.x0);
+  // the checkbox and flag read as junk ("O'®Mark"), and a stitched shot can
+  // repeat the line ("Mark Mark Question Question")
+  const toks = line.map((w) => w.text).join(" ").replace(/[^A-Za-z]+/g, " ")
+    .trim().split(" ").filter((t) => t.length > 1).map((t) => t.toLowerCase());
+  if (!toks.includes("mark") || !toks.every((t) => t === "mark" || t === "question")) return top;
+  return Math.max(...line.map((w) => w.y1)) + lh * 0.3;
+}
+
 /* Consecutive pages sharing one header item number become one group. */
 function groupPages(nums) {
   const groups = [];
@@ -1375,6 +1539,8 @@ function itemGroups(texts) {
     pages.push(i + 1);
     nums.push(n);
   });
+  dropCoverPages(texts, pages, nums);
+  fixStaleHeaders(texts, pages, nums);
   return groupPages(nums).map((g) => g.map((i) => pages[i]));
 }
 
@@ -1400,8 +1566,11 @@ function itemGroups(texts) {
    its neighbours; a page with nothing readable takes the number its
    neighbours leave free. */
 
-// "Item 7 of 50", "Question 7 Of 50", "item 7 of 50", "Items 44-45 of 50"
-const HEADER_ANY = /\b(?:Item|Question)s?\s*(\d{1,3})(?:\s*[-–—]\s*(\d{1,3}))?\s*of\s*(\d{1,3})?/i;
+// "Item 7 of 50", "Question 7 Of 50", "item 7 of 50", "Items 44-45 of 50",
+// and the newer client's "Item: 2 of 50" and the fused readings of its header
+// bar ("item2of50", "ttem3of50", "item10f50" for item 1): the same allowances
+// as HEADER_ITEM, so a header the bar pass recovered is a candidate here too
+const HEADER_ANY = /\b(?:[Iil1t]tem|Question)s?\s*:?\s*(\d{1,3}?)(?:\s*[-–—]\s*(\d{1,3}))?\s*[Oo0]f(?![a-z])\s*(\d{1,3})?/i;
 const HEADER_ALL = new RegExp(HEADER_ANY.source, "gi");
 
 /* The exam's length, from the "of N" its page headers print, or null. Taken
@@ -1606,6 +1775,16 @@ function numberPages(texts, fresh, skip) {
     pages.push(i);
     cands.push(pageNumberCandidates(t, total));
   });
+  // The exam's cover (see dropCoverPages): leading pages with no number and
+  // no answer choices, while nearly every page after them is numbered, are
+  // not items. Left in, the cover took the first item's number and was
+  // stitched on top of its first shot.
+  if (cands.filter((c) => c.size).length >= cands.length * 0.8) {
+    while (cands.length && !cands[0].size && !FIRST_CHOICE.test(texts[pages[0]])) {
+      cands.shift();
+      pages.shift();
+    }
+  }
   const covered = cands.filter((c) => c.size).length;
   const reliable = pages.length > 0 && covered >= pages.length * 0.6;
   let maxN = total || 0;
@@ -1665,6 +1844,42 @@ function numberPages(texts, fresh, skip) {
     used.add(x);
   }
   return { groups, nums, total, reliable };
+}
+
+/* A screenshot taken while the client was still turning the page keeps the
+   previous item's header over the next item's stem: Internal Medicine 2 page
+   21 reads "Item 20 of 50" (with "Please Wait" beside it) above "21. A
+   78-year-old woman…", and the two pages were stitched into one item 20
+   while item 21 vanished. When a page repeats the header before it but its
+   stem opens with the next number, the stem is right. */
+function fixStaleHeaders(texts, pages, nums) {
+  const stemNo = (t) => {
+    const m = t.match(/(?:^|\n)[^\S\n]*(\d{1,3})\.[^\S\n]+[A-Z]/);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  for (let i = 1; i < nums.length; i++) {
+    const n = nums[i];
+    if (n === null || nums[i - 1] !== n) continue;
+    if (stemNo(texts[pages[i] - 1]) !== n + 1) continue;
+    const before = stemNo(texts[pages[i - 1] - 1]);
+    if (before !== null && before !== n) continue;
+    nums[i] = n + 1;
+  }
+}
+
+/* The newer NBME client's capture opens on the exam's cover -- the NBME
+   logo, "Pediatrics Self-Assessment" and a paragraph of copyright notice
+   (Pediatrics 9) -- which is wordy enough to pass for an item and made a
+   51st. A page before the first numbered one is a cover when it carries no
+   number and no answer choices while nearly every page after it is
+   numbered. */
+function dropCoverPages(texts, pages, nums) {
+  const numbered = nums.filter((n) => n !== null).length;
+  if (numbered < nums.length * 0.8) return;
+  while (nums.length && nums[0] === null && !FIRST_CHOICE.test(texts[pages[0] - 1])) {
+    nums.shift();
+    pages.shift();
+  }
 }
 
 /* Content words long enough to anchor on, keyed by text, uniques only. */
@@ -1958,7 +2173,7 @@ const TESS_SRC = `https://cdn.jsdelivr.net/npm/tesseract.js@${TESS_VERSION}/dist
 const OCR_DPI = 200;                   // the screenshots are ~2670px wide: about native
 const OCR_MIN_PX = 3300;               // ...but see the scale note in ocrDocument
 const OCR_MAX_SCALE = 6;               // bound the canvas for a very small page
-const OCR_CACHE_VERSION = 2;           // bump to invalidate every cached page
+const OCR_CACHE_VERSION = 3;           // bump to invalidate every cached page
 const OCR_DB = "exam-parser-ocr", OCR_STORE = "pages";
 
 /* Load tesseract.js on demand. Its worker, wasm core and language data all
@@ -1993,14 +2208,66 @@ function loadTesseract() {
    key can be mixed. */
 async function docIsImageOnly(doc) {
   const n = Math.min(3, doc.numPages);
-  let chars = 0;
+  let chars = 0, untexted = 0;
   for (let i = 1; i <= n; i++) {
     const page = await doc.getPage(i);
     const tc = await page.getTextContent();
     for (const it of tc.items) chars += (it.str.match(/[A-Za-z0-9]/g) || []).length;
+    try {
+      if (await screenshotUntexted(page, tc)) untexted++;
+    } catch (e) { /* no operator list: judge by the text alone */ }
     page.cleanup();
   }
-  return chars / n < 60;
+  return chars / n < 60 || untexted === n;
+}
+
+/* A page can carry a real text layer and still have its question only as a
+   picture. Internal Medicine 1 and 2 are OneNote clippings: OneNote writes
+   the clipping's date, "Screen Clipping" and "New Section 1 Page 4" as text,
+   which clears the 60-character bar above, while the NBME screenshot under
+   them is an image with no text at all -- so nothing was recognised and the
+   forms came out as 8 and 2 items. Such a page has wide images covering a
+   fair part of it (a short item's clipping fills barely a quarter of the
+   sheet) with (almost) no text over them; a PDF whose screenshots
+   carry a text layer (an OCR'd export, or the client's own print) has its
+   text right on top of them. Measured in display space, after the page's
+   rotation, because OneNote prints landscape pages rotated. */
+async function screenshotUntexted(page, tc) {
+  const U = window.pdfjsLib.Util, OPS = window.pdfjsLib.OPS;
+  const vp = page.getViewport({ scale: 1 });
+  const ops = await page.getOperatorList();
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [], boxes = [];
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i], args = ops.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+    else if (fn === OPS.transform) ctm = U.transform(ctm, args);
+    else if (fn === OPS.paintFormXObjectBegin) {
+      stack.push(ctm);
+      if (args && args[0]) ctm = U.transform(ctm, args[0]);
+    } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+      const m = U.transform(vp.transform, ctm);
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map((p) => U.applyTransform(p, m));
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      boxes.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+    }
+  }
+  const W = vp.width, H = vp.height;
+  const wide = boxes.filter((b) => b[2] - b[0] >= W * 0.5);
+  if (!wide.length) return false;
+  const pts = tc.items.filter((it) => /[A-Za-z0-9]/.test(it.str)).map((it) => {
+    const m = U.transform(vp.transform, it.transform);
+    return { x: m[4], y: m[5], n: (it.str.match(/[A-Za-z0-9]/g) || []).length };
+  });
+  let area = 0;
+  for (const b of wide) {
+    let inside = 0;
+    for (const p of pts) if (p.x >= b[0] && p.x <= b[2] && p.y >= b[1] && p.y <= b[3]) inside += p.n;
+    if (inside < 40) area += (b[2] - b[0]) * (b[3] - b[1]);
+  }
+  return area >= W * H * 0.15;
 }
 
 async function sha256Hex(bytes) {
@@ -2385,7 +2652,12 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
                                               { blocks: true, text: true });
       const hdr = (data.text.match(HEADER_ITEM) || [])[1] || null;
       const rec = ocrPageRecord(data, scale, canvas.height, hdr);
-      if (!hdr) needHeader.push(p);
+      // A header seen in the raw text can still be lost from the record, when
+      // its fused word ("item3of50") falls under the confidence cut; such a
+      // page is read again like one with no header at all.
+      if (!hdr || !HEADER_ITEM.test(ocrLines(rec).map((l) => l.text).join("\n"))) {
+        needHeader.push(p);
+      }
       pages.set(p, rec);
       canvas.width = canvas.height = 1;      // release the bitmap
       if (db) await idbPut(db, `${hash}:${OCR_CACHE_VERSION}:${p}`, rec);
@@ -2405,23 +2677,60 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
   if (needHeader.length) {
     const hw = await Tesseract.createWorker("eng", 1, wopts);
     await hw.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1" });
+    const barReads = [];
     for (const p of needHeader) {
       onProgress(`Reading page headers (${needHeader.indexOf(p) + 1} of ${needHeader.length})…`,
                  span[1] - (span[1] - span[0]) * 0.04);
       const full = await renderForOcr(doc, p, scale);
-      let found = null;
+      const reads = [];
       for (const invert of [false, true]) {
         const strip = headerStrip(full, invert);
         const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
         strip.width = strip.height = 1;
-        if (HEADER_ITEM.test(data.text)) { found = data; break; }
+        if (HEADER_ITEM.test(data.text)) { reads.push({ data, f: 2, x0: 0, y0: 0, h: full.height }); break; }
+      }
+      // A header bar's words run together and its digits blur into the "of"
+      // (see HEADER_ITEM), and each enlargement misreads a different page, so
+      // the bar is read at three sizes and every reading is kept; the page
+      // sequence picks between them once all pages are in.
+      for (const k of reads.length ? [] : [0.8, 1.1, 1.5]) {
+        const strip = headerBar(full, k);
+        if (!strip) break;
+        const { data } = await hw.recognize(strip, {}, { blocks: true, text: true });
+        const x0 = strip.x0, y0 = strip.y0, f = strip.f;
+        strip.width = strip.height = 1;
+        if (HEADER_ITEM.test(data.text)) reads.push({ data, f, x0, y0, h: 1e9 });
       }
       full.width = full.height = 1;
-      if (!found) { stats.noHeader.push(p); continue; }
+      if (reads.length) barReads.push({ p, reads });
+      else stats.noHeader.push(p);
+    }
+    for (const { p, data, f, x0, y0, h, num, total } of settleBarHeaders(barReads, pages, n)) {
       const rec = pages.get(p);
-      const strip = ocrPageRecord(found, scale * 2, full.height, null);
-      // the strip is the page's own top, at twice the scale: its coordinates
-      // already divide back to the same points as the rest of the page
+      const strip = ocrPageRecord(data, scale * f, h, null);
+      // the strip is the page's own top, enlarged: its coordinates already
+      // divide back to the same points as the rest of the page, once a bar
+      // cut from further down is put back where it was
+      for (const L of strip.L) {
+        L.b = +(L.b + y0 / scale).toFixed(2);
+        for (const w of L.w) {
+          w[0] = +(w[0] + x0 / scale).toFixed(2);
+          w[1] = +(w[1] + x0 / scale).toFixed(2);
+        }
+      }
+      // The header is restated as the number settled on whenever the words
+      // kept for the page do not already say it: the sequence may have
+      // overruled the reading, or the fused "item2of50" was dropped as a
+      // low-confidence word.
+      const own = (strip.L.map((L) => L.w.map((w) => w[2]).join(" ")).join("\n")
+        .match(HEADER_ITEM) || [])[1];
+      if (own === undefined || parseInt(own, 10) !== num) {
+        for (const L of strip.L) {
+          L.w = L.w.filter((w) => !/tem|Question/.test(w[2]) && !HEADER_ITEM.test(w[2]));
+        }
+        strip.L = strip.L.filter((L) => L.w.length);
+        strip.L.push(headerLine(data, scale * f, x0 / scale, y0 / scale, `Item ${num} of ${total}`));
+      }
       rec.L = strip.L.concat(rec.L).sort((a, b) => a.b - b.b);
       pages.set(p, rec);
       stats.headerFallback++;
@@ -2431,6 +2740,140 @@ async function ocrDocument(doc, hash, label, onProgress, span) {
   }
   onProgress(`${label} — done`, span[1]);
   return { pages, stats };
+}
+
+/* A one-word line restating a page's header, placed where tesseract saw the
+   header's first word (PDF points). */
+function headerLine(data, k, dx, dy, text) {
+  let hit = null;
+  for (const b of data.blocks || []) {
+    for (const p of b.paragraphs || []) {
+      for (const l of p.lines || []) {
+        for (const w of l.words || []) {
+          if (!hit && /tem|Question/.test(w.text)) hit = w.bbox;
+        }
+      }
+    }
+  }
+  const bb = hit || { x0: 0, x1: 100, y0: 0, y1: 20 };
+  const fs = (bb.y1 - bb.y0) / k;
+  return { b: +(bb.y1 / k + dy).toFixed(2), f: +fs.toFixed(2),
+           w: [[+(bb.x0 / k + dx).toFixed(2), +(bb.x1 / k + dx).toFixed(2), text]] };
+}
+
+/* Pick each bar-read page's item number. Every reading of a page offers its
+   number, plus that number less a trailing zero when the digits run straight
+   into the "of" ("item20of50" for "Item 2 of 50": the o is read twice, once
+   as a 0). Pages come in item order -- one or more shots per item -- so the
+   right candidate is the one that equals or follows the last page's number;
+   failing that, the one the readings agree on most, never beyond the total.
+   Pages whose own text named their item anchor the sequence. */
+function settleBarHeaders(barReads, pages, n) {
+  if (!barReads.length) return [];
+  const byPage = new Map(barReads.map((r) => [r.p, r]));
+  const out = [];
+  let prev = null;
+  for (let p = 1; p <= n; p++) {
+    const br = byPage.get(p);
+    if (!br) {
+      const rec = pages.get(p);
+      const t = rec ? rec.L.map((L) => L.w.map((w) => w[2]).join(" ")).join("\n") : "";
+      const m = t.match(HEADER_ITEM);
+      if (m) prev = parseInt(m[1], 10);
+      continue;
+    }
+    const votes = new Map();
+    let total = null;
+    for (const { data } of br.reads) {
+      const t = data.text;
+      const m = t.match(HEADER_ITEM);
+      const k = parseInt(m[1], 10);
+      const tm = t.slice(m.index + m[0].length).match(/^\s*(\d+)/);
+      if (tm && (!total || +tm[1] < total)) total = +tm[1];
+      const cands = [k];
+      if (k >= 10 && k % 10 === 0 && /\d0[Oo]f/.test(m[0])) cands.push(k / 10);
+      cands.forEach((c, i) => votes.set(c, (votes.get(c) || 0) + (i ? 0.9 : 1)));
+    }
+    let ok = [...votes.keys()].filter((c) => c >= 1 && (!total || c <= total));
+    if (!ok.length) continue;
+    let num = null;
+    if (prev !== null) {
+      const next = ok.filter((c) => c === prev || c === prev + 1);
+      if (next.length) num = next.sort((a, b) => votes.get(b) - votes.get(a))[0];
+    }
+    if (num === null) num = ok.sort((a, b) => votes.get(b) - votes.get(a))[0];
+    prev = num;
+    const r = br.reads[0];
+    out.push({ ...r, p, num, total: total || "" });
+  }
+  return out;
+}
+
+/* The newer NBME client prints "Item 2 of 50" in white inside a blue bar
+   that sits below a strip of white page and beside the question-status rail
+   (Internal Medicine 10). Whole-page recognition reads nothing there, and the
+   plain header strip mixes the white margin with the bar, so neither polarity
+   suits it: 53 of 57 question pages lost their number. Cut out just the bar --
+   the first band of dark rows near the top -- and read it inverted, as dark
+   text on light. `x0`/`y0` is where the bar starts, in the canvas's own
+   pixels, and `f` how much it was enlarged. */
+function headerBar(canvas, k) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const H = Math.round(canvas.height * 0.25), W = canvas.width;
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const dark = (y) => {
+    let n = 0, k = 0;
+    for (let x = Math.round(W * 0.15); x < W * 0.85; x += 4, k++) {
+      if (d[(y * W + x) * 4] < 140) n++;
+    }
+    return n / k > 0.6;
+  };
+  let y0 = 0;
+  while (y0 < H && !dark(y0)) y0++;
+  let y1 = y0;
+  while (y1 < H && dark(y1)) y1++;
+  if (y1 - y0 < canvas.height * 0.02) return null;
+  // Only the bar's own columns: a question-status rail beside it prints
+  // dark-on-light ("Question Status" on Pediatrics 9), and once inverted
+  // that block garbled the header on the same text line.
+  const colDark = (x) => {
+    let n = 0;
+    for (let y = y0; y < y1; y++) if (d[(y * W + x) * 4] < 140) n++;
+    return n / (y1 - y0) > 0.5;
+  };
+  // the widest run of bar-coloured columns, stepping over the thin light
+  // rules inside it (the box around "Item: 2 of 50")
+  let x0 = 0, x1 = W, best = 0, from = -1, last = -1;
+  for (let x = 0; x <= W; x++) {
+    if (x < W && colDark(x)) {
+      if (from < 0 || x - last > W * 0.01) from = x;
+      last = x;
+      if (last - from > best) { best = last - from; x0 = from; x1 = last + 1; }
+    }
+  }
+  if (best < W * 0.5) { x0 = 0; x1 = W; }
+  y0 = Math.max(0, y0 - 2); y1 = Math.min(H, y1 + 2);
+  // Tesseract reads text best at a few dozen pixels high, and bars come in
+  // every size (Internal Medicine 10's is 115 rows at OCR scale, Pediatrics
+  // 9's 245), so the enlargement is set from the bar's own height; `k` asks
+  // for a little more or less of it.
+  const f = Math.max(0.5, Math.min(6, k * 300 / (y1 - y0)));
+  const c = document.createElement("canvas");
+  c.width = (x1 - x0) * f;
+  c.height = (y1 - y0) * f;
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  cx.imageSmoothingQuality = "high";
+  cx.drawImage(canvas, x0, y0, x1 - x0, y1 - y0, 0, 0, c.width, c.height);
+  const im = cx.getImageData(0, 0, c.width, c.height);
+  const e = im.data;
+  for (let i = 0; i < e.length; i += 4) {
+    e[i] = 255 - e[i]; e[i + 1] = 255 - e[i + 1]; e[i + 2] = 255 - e[i + 2];
+  }
+  cx.putImageData(im, 0, 0);
+  c.x0 = x0;
+  c.y0 = y0;
+  c.f = f;
+  return c;
 }
 
 function headerStrip(canvas, invert) {
@@ -2479,24 +2922,109 @@ function ocrWords(rec, viewport) {
   return raw;
 }
 
+/* The newer NBME client runs a "Question Status" rail down the left edge of
+   the window: one row per item, numbered 1, 2, 3… with a bullet, a flag or a
+   tick in front (Internal Medicine 10, Pediatrics 9). OCR reads those numbers
+   as words, and every one that shares a baseline with a stem line joins it,
+   so "has Alzheimer disease" came back as "15 has Alzheimer disease", stems
+   and keys stopped matching, and the rail's shading and flags were cut out as
+   figures. The rail is recognised by what it is -- a narrow column at the far
+   left of short numbers that mostly count upwards, evenly spaced -- and
+   everything in it is dropped. `edge` (PDF points) is where the item's own
+   content begins, so the page image can be blanked up to it too.
+
+   Coordinates are the cached record's own (PDF points), and this runs as the
+   record is served rather than when it is recognised, so pages already in the
+   OCR cache are cleaned without being read again. */
+function stripStatusRail(rec, pageW) {
+  const none = { rec, edge: 0 };
+  if (!rec || !rec.L.length) return none;
+  const nums = [];
+  for (const L of rec.L) {
+    for (const w of L.w) {
+      if (w[0] > pageW * 0.12) break;
+      const m = w[2].match(/^[^A-Za-z0-9]{0,2}(\d{1,3})[.,]?$/);
+      if (m) { nums.push({ b: L.b, f: L.f, x0: w[0], x1: w[1], n: +m[1] }); break; }
+    }
+  }
+  if (nums.length < 8) return none;
+  // one column: the numbers line up within a couple of characters
+  const mx = median(nums.map((t) => t.x0));
+  const f = median(nums.map((t) => t.f));
+  const col = nums.filter((t) => Math.abs(t.x0 - mx) <= f * 2).sort((a, b) => a.b - b.b);
+  if (col.length < 8) return none;
+  // OCR misreads a few of the numbers and catches the odd stray digit, so
+  // ask only that most of them count upwards down the page: the longest
+  // increasing run (not necessarily contiguous) must hold 60 percent of them
+  const len = col.map(() => 1), prevI = col.map(() => -1);
+  for (let i = 1; i < col.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (col[j].n < col[i].n && len[j] + 1 > len[i]) { len[i] = len[j] + 1; prevI[i] = j; }
+    }
+  }
+  let end = 0;
+  for (let i = 1; i < col.length; i++) if (len[i] > len[end]) end = i;
+  if (len[end] < Math.max(8, col.length * 0.6)) return none;
+  const run = [];
+  for (let i = end; i >= 0; i = prevI[i]) run.unshift(col[i]);
+  const steps = [];
+  for (let i = 1; i < run.length; i++) {
+    steps.push((run[i].b - run[i - 1].b) / (run[i].n - run[i - 1].n));
+  }
+  // evenly spaced: most rows sit one rail pitch apart
+  const pitch = median(steps);
+  const even = steps.filter((s) => Math.abs(s - pitch) <= pitch * 0.35).length;
+  if (pitch <= 0 || even < steps.length * 0.5) return none;
+
+  const railX1 = Math.max(...col.map((t) => t.x1));
+  // the item's own left margin: the first real word right of the rail
+  let left = Infinity;
+  for (const L of rec.L) {
+    for (const w of L.w) {
+      if (w[0] > railX1 + f * 0.5 && /[A-Za-z]{3,}/.test(w[2])) left = Math.min(left, w[0]);
+    }
+  }
+  if (!isFinite(left)) return none;
+  const cut = Math.min(left - f * 0.3, railX1 + f * 3);
+  const L2 = [];
+  for (const L of rec.L) {
+    const w = L.w.filter((t) => !(t[0] < cut && t[1] < left - f * 0.3));
+    if (w.length) L2.push({ ...L, w });
+  }
+  return { rec: { ...rec, L: L2 }, edge: Math.min(left - f * 0.5, railX1 + f * 6) };
+}
+
 /* One accessor for a document's text, whether it has a text layer or was
    recognized. Everything in parseExam goes through this, so the OCR path and
    the text path are the same code from here on. */
 function makeSource(doc, ocrPages) {
+  const railed = new Map();
+  async function ocrPage(p) {
+    if (!railed.has(p)) {
+      const page = await doc.getPage(p);
+      railed.set(p, stripStatusRail(ocrPages.get(p), page.getViewport({ scale: 1 }).width));
+    }
+    return railed.get(p);
+  }
   return {
     doc,
     numPages: doc.numPages,
     ocr: !!ocrPages,
     async lines(p, foldSubscripts) {
-      if (ocrPages) return ocrLines(ocrPages.get(p));
+      if (ocrPages) return ocrLines((await ocrPage(p)).rec);
       return getPageLines(await doc.getPage(p), foldSubscripts);
     },
     async text(p) {
       return (await this.lines(p)).map((l) => l.text).join("\n");
     },
     async words(p, viewport) {
-      if (ocrPages) return ocrWords(ocrPages.get(p), viewport);
+      if (ocrPages) return ocrWords((await ocrPage(p)).rec, viewport);
       return getPageWords(await doc.getPage(p), viewport);
+    },
+    // where the content starts right of a question-status rail, in PDF
+    // points (0 when the page has none)
+    async railEdge(p) {
+      return ocrPages ? (await ocrPage(p)).edge : 0;
     },
   };
 }
@@ -2899,6 +3427,22 @@ async function readAnnotatedKey(doc, src, hash, onProgress, nItems) {
   return key;
 }
 
+/* Blank the question-status rail out of a rendered page (see
+   stripStatusRail), so its shading, flags and the scrollbar beside it are
+   never taken for an exhibit or a radio circle. Only the copy the parser
+   measures is touched; the page image shown to the reader keeps it. */
+function blankRail(im, edgePx, top, bottom) {
+  const x1 = Math.min(im.width, Math.round(edgePx));
+  if (x1 <= 0) return;
+  const d = im.data;
+  for (let y = Math.max(0, top); y < Math.min(im.height, bottom); y++) {
+    for (let x = 0; x < x1; x++) {
+      const i = (y * im.width + x) * 4;
+      d[i] = d[i + 1] = d[i + 2] = 255;
+    }
+  }
+}
+
 /* ---------------- main ------------------------------------------------- */
 
 async function parseExam(qBytes, aBytes, onProgress, opts) {
@@ -3096,6 +3640,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       // "Invert / Contrast / Zoom" chrome in front of it (items 12, 18), and
       // four items came out unkeyed while the key sat on the facing page.
       if (aGroups.length === nq && groupLetter.has(gi)) return [gi, groupLetter.get(gi)];
+      // (a page whose key line was lost names its wrong choices instead;
+      // keyFor works the letter out from them, by the same position rule)
       return [null, null];
     }
     return [bestGroup, bestLetter];
@@ -3123,6 +3669,12 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
         const r = similarity(qStem, p.key);
         if (r >= best) { best = r; ex = p; }
       }
+    }
+    // ...or, with the key and the questions one to one, the page in this
+    // item's place (Psychiatry 8: OCR lost "Correct Answer: E." on items 18,
+    // 28, 32 and 46, whose pages still list the wrong choices)
+    if (!ex && aGroups.length === nq && !groupLetter.has(gi)) {
+      ex = exclPages.find((p) => p.group === gi) || null;
     }
     const left = ex ? choices.map((c) => c.letter).filter((L) => !ex.excl.has(L)) : [];
     if (left.length === 1 && [...ex.excl].every((L) => choices.some((c) => c.letter === L))) {
@@ -3159,7 +3711,10 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     const im = cx.getImageData(0, 0, w, h);
     const band = contentBand(im.data, w, h);
     if (band[0] === 0 && band[1] === h) bandFallback.questions.push(p);
-    return { canvas: c, img: im, w, h, band, words: await qSrc.words(p, viewport) };
+    // the question-status rail, blanked from the copy that is measured
+    const rail = (await qSrc.railEdge(p)) * SCALE;
+    blankRail(im, rail, 0, h);
+    return { canvas: c, img: im, w, h, band, rail, words: await qSrc.words(p, viewport) };
   }
   function blankShot() {
     const c = document.createElement("canvas");
@@ -3265,8 +3820,11 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     } catch (e) {
       st = stitchShots([shots[0]]);    // never lose the exam over one item's layout
     }
+    // the rail is blanked shot by shot (renderShot), and once more across
+    // the stitched canvas so no seam of it survives
+    if (shots.length > 1) blankRail(st.img, Math.max(0, ...shots.map((x) => x.rail || 0)), 0, st.h);
     const canvas = st.canvas, img = st.img, rawWords = tidyChoiceWords(st.words);
-    const top = st.top, bottom = st.bottom;
+    const top = belowMarkLine(rawWords, st.top, st.bottom), bottom = st.bottom;
     const w = st.w, h = st.h;
     const cw = st.w, ch = bottom - top;
     const itemText = group.length === 1 ? qTexts[pno - 1] : textFromWords(rawWords);
@@ -3335,6 +3893,14 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
         // pyogenes (group A)" on Form 4 item 44, "E. coli" on Form 5 item 9,
         // both of which this flagged as broken runs until it asked.
         const lh = wd.y1 - wd.y0;
+        // The radio circle read as a label of its own ("O)" in front of
+        // "B." on Internal Medicine 9, whose capture app draws a hollow
+        // circle a little way left of the letter) is not a lost choice: the
+        // row's real label sits right after it.
+        if (ordered.some(([, bx]) => Math.abs(bx.base - wd.base) <= lh * 0.5 &&
+                                     bx.x0 >= wd.x1 - 2 && bx.x0 - wd.x1 < lh * 1.5)) {
+          return false;
+        }
         return !rawWords.some((o) => o !== wd && Math.abs(o.base - wd.base) <= lh * 0.5 &&
                                      o.x1 <= wd.x0 + 2 && wd.x0 - o.x1 < lh * 0.6 &&
                                      !LABEL_JUNK.test(o.text));
