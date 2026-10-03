@@ -740,11 +740,18 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
     const ux1 = Math.max(a.x1, b.x1), uy1 = Math.max(a.y1, b.y1);
     const over = (f, L) => Math.max(0, Math.min(f.x1, L.x1) - Math.max(f.x0, L.x0)) *
                            Math.max(0, Math.min(f.y1, L.y1) - Math.max(f.y0, L.y0));
+    // A line of prose lying wholly between the two, across the gap, also
+    // keeps them apart however little of it the union covers: Internal
+    // Medicine 10 item 25's lab table was merged with a sliver of ink below
+    // the sentence under it, and the crop cut that sentence in half.
+    const gapTop = Math.min(a.y1, b.y1), gapBot = Math.max(a.y0, b.y0);
     return lines.some((L) => {
       if (L.inFig) return false;
       const area = Math.max(1, (L.x1 - L.x0) * (L.y1 - L.y0));
-      return over({ x0: ux0, y0: uy0, x1: ux1, y1: uy1 }, L) / area > 0.3 &&
-             !over(a, L) && !over(b, L);
+      if (over({ x0: ux0, y0: uy0, x1: ux1, y1: uy1 }, L) / area > 0.3 &&
+          !over(a, L) && !over(b, L)) return true;
+      return L.words.length >= 5 && L.y0 >= gapTop - 2 && L.y1 <= gapBot + 2 &&
+             Math.min(ux1, L.x1) - Math.max(ux0, L.x0) > 0;
     });
   }
   function mergeFigs() {
