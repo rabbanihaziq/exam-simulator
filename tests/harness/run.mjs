@@ -206,7 +206,11 @@ const summary = await page.evaluate(async (hasAnswers) => {
   const parseMs = performance.now() - t1;
   return { count: window.DATA.count, title: window.DATA.title,
            parseMs, fetchMs, prog, ocr: window.DATA.ocr || null,
-           bandFallback: window.DATA.bandFallback || null };
+           bandFallback: window.DATA.bandFallback || null,
+           declaredTotal: window.DATA.declaredTotal ?? null,
+           // the review screen's answer-page browser: render the first page
+           answerPage0: window.DATA.answerPageImage
+             ? ((await window.DATA.answerPageImage(0)) || "").length : 0 };
 }, Boolean(aPdf), { timeout: 0 });
 const wallMs = Date.now() - t0;
 console.log(`parsed ${summary.count} items in ${(summary.parseMs / 1000).toFixed(1)}s ` +
@@ -255,7 +259,8 @@ items.forEach((it, i) => { it.answer_info = aInfo[i]; });
 
 await fsp.writeFile(path.join(out, "items.json"),
   JSON.stringify({ source: { q: qPdf, a: aPdf }, title: summary.title,
-                   count: summary.count, ocr: summary.ocr,
+                   count: summary.count, declared_total: summary.declaredTotal,
+                   answer_page0_bytes: summary.answerPage0, ocr: summary.ocr,
                    parse_seconds: +(summary.parseMs / 1000).toFixed(2),
                    items }, null, 1));
 // HARNESS_WORDS=31,43 dumps those items' raw word boxes, which is the only way

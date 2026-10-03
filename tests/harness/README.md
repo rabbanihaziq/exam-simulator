@@ -40,7 +40,7 @@ Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 
 | file | contents |
 |---|---|
-| `items.json` | per item: `item`, `correct`, `answer_available`, `q_pages`, `a_pages`, `mode` (`text`/`image`), stem paragraphs, choice texts, the answer-key explanation size (`answer_info`), and for every figure block `y`, `x0f`, `wf`, `fr` and the pixel rect `px` = `[x0,y0,x1,y1]`; plus the document-level `ocr` stats (pages, cache hits, header-strip fallbacks) when the parser had to OCR |
+| `items.json` | per item: `item`, `correct`, `answer_available`, `q_pages`, `a_pages`, `mode` (`text`/`image`), stem paragraphs, choice texts, the answer-key explanation size (`answer_info`), and for every figure block `y`, `x0f`, `wf`, `fr` and the pixel rect `px` = `[x0,y0,x1,y1]`; plus the document-level `ocr` stats (pages, cache hits, header-strip fallbacks) when the parser had to OCR, `declared_total` (the headers' "of N") and `answer_page0_bytes` (size of `answerPageImage(0)`'s data URL, 0 with no key) |
 | `item<N>_fig<k>.png` | every figure crop the parser produced |
 | `item<N>.png` | side-by-side preview at 900 px per pane: left = the original content-area page render, right = the text-mode HTML render |
 | `summary.txt` | item/keyed/text-mode/figure counts, wall-clock parse time, a one-line-per-item table, and anything the page logged to the console |
