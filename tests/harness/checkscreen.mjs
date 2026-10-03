@@ -231,8 +231,23 @@ if (ONLY.includes("dup")) {
 
 /* ======================================================================= */
 if (ONLY.includes("broken")) {
-  console.log("\n== broken: Internal Medicine 6 (key not read) ==");
+  // Internal Medicine 6's key used to go unread; the parser reads it now, so
+  // wrap parseExam to drop every match and get a form with no key letters.
+  console.log("\n== broken: Internal Medicine 6 with its key matches dropped ==");
+  const dropKeys = () => page.evaluate(() => {
+    const orig = window.parseExam;
+    window.parseExam = async (...args) => {
+      const d = await orig(...args);
+      for (const it of d.items) {
+        it.correct = null; it.answer_available = false; it.a_group = null; it.key_source = null;
+      }
+      d.answerInfo = async () => null;
+      d.answerURL = async () => null;
+      return d;
+    };
+  });
   await openPage(true);
+  await dropKeys();
   await loadPdfs("m6q", "m6a");
   let s = await stats();
   console.log(`  summary: "${s.summary}"`);
@@ -260,6 +275,7 @@ if (ONLY.includes("broken")) {
 
   // reload, load the same PDFs again: the fixes come back by themselves
   await openPage(false);
+  await dropKeys();
   await loadPdfs("m6q", "m6a");
   s = await stats();
   console.log(`  after reload: "${s.summary}"`);
@@ -296,6 +312,15 @@ if (ONLY.includes("broken")) {
   await gotoItem(3);
   const strip = await page.$eval("#resultstrip", (e) => e.textContent);
   check(/Correct answer per the page\?/.test(strip), "review asks 'Correct answer per the page?'", strip);
+  await page.waitForFunction(() => {
+    const im = document.querySelector("#naNote .kp-img");
+    return im && /^data:image\/png/.test(im.src);
+  }, { timeout: 30000 });
+  const kp1 = await page.$eval("#naNote .kp-pos", (e) => e.textContent);
+  await page.click('#naNote .kp-nav button[data-d="1"]');
+  await page.waitForFunction((p) => document.querySelector("#naNote .kp-pos").textContent !== p, {}, kp1);
+  const kp2 = await page.$eval("#naNote .kp-pos", (e) => e.textContent);
+  check(/^Key page \d+ of \d+$/.test(kp1) && kp1 !== kp2, "unmatched item can page through the key", [kp1, kp2]);
   await page.click('#resultstrip .kp-btn[data-key="A"]');
   await sleep(150);
   sc = await score();

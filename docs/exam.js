@@ -303,6 +303,10 @@ function summaryDetail(s) {
   bits.push(DATA.hasKeyPdf ? `${s.keyed} keyed` : "no answer key, so the sitting is unscored");
   if (s.images) bits.push(`${s.images} shown as page image${s.images === 1 ? "" : "s"}`);
   if (DATA.renumbered) bits.push("item numbers set by page order");
+  if (DATA.declaredTotal && DATA.declaredTotal !== DATA.count) {
+    bits.push(`the pages say "of ${DATA.declaredTotal}" but ${DATA.count} items were found, ` +
+      `so ${DATA.declaredTotal > DATA.count ? "some pages may be missing from this PDF" : "some pages may be split items"}`);
+  }
   return bits.join(" · ");
 }
 
@@ -1612,13 +1616,44 @@ async function showReview(i) {
     if (url) { img.src = url; img.style.display = "block"; }
     else if (!keyed && !it.removed) {
       na.style.display = "block";
-      na.textContent = DATA.hasKeyPdf
-        ? `No answer-key page was matched to item ${it.item}. If you know the answer, ` +
-          `tap its letter above and the score updates.`
-        : `No answer key was loaded. If you know the answer, tap its letter above ` +
-          `and the score updates.`;
+      if (DATA.hasKeyPdf && DATA.answerPageCount && DATA.answerPageImage) {
+        browseKeyPages(it, requested);
+      } else {
+        na.textContent = DATA.hasKeyPdf
+          ? `No answer-key page was matched to item ${it.item}. If you know the answer, ` +
+            `tap its letter above and the score updates.`
+          : `No answer key was loaded. If you know the answer, tap its letter above ` +
+            `and the score updates.`;
+      }
     }
   }
+}
+
+/* No answer page was matched to this item: let the user page through the
+   answer PDF, starting where the item would sit if the key ran in order, and
+   read the letter off it. */
+function browseKeyPages(it, requested) {
+  const na = $("naNote"), count = DATA.answerPageCount;
+  let k = Math.min(count - 1,
+    Math.floor(cur * count / Math.max(1, DATA.items.length)));
+  na.innerHTML =
+    `No answer-key page was matched to item ${it.item}. Find it in the key below, ` +
+    `then tap its letter above and the score updates.` +
+    `<div class="kp-nav"><button data-d="-1">‹ Previous page</button>` +
+    `<span class="kp-pos"></span><button data-d="1">Next page ›</button></div>` +
+    `<img class="kp-img" alt="Answer-key page">`;
+  const show = async () => {
+    na.querySelector(".kp-pos").textContent = `Key page ${k + 1} of ${count}`;
+    const url = await DATA.answerPageImage(k);
+    if (cur !== requested || !reviewing) return;
+    const im = na.querySelector(".kp-img");
+    if (url) { im.src = url; im.style.display = "block"; } else im.style.display = "none";
+  };
+  na.querySelectorAll(".kp-nav button").forEach((b) => b.onclick = () => {
+    k = Math.max(0, Math.min(count - 1, k + Number(b.dataset.d)));
+    show();
+  });
+  show();
 }
 
 function layoutReview(it) {

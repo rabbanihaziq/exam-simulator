@@ -557,3 +557,10 @@ table.lab tr.hide{display:none;}
   #labPanel{position:absolute;inset:0 0 0 auto;width:min(90%,420px);min-width:0;z-index:20;
     box-shadow:-8px 0 26px rgba(0,0,0,.2);}
 }
+
+/* answer-key page browser, for an item no key page was matched to */
+.kp-nav { display: flex; align-items: center; gap: 10px; margin: 10px 0 8px; }
+.kp-nav button { font: inherit; font-size: 13px; padding: 4px 10px; border: 1px solid #9fb3c8;
+  background: #fff; color: #1c4873; border-radius: 4px; cursor: pointer; }
+.kp-pos { font-size: 13px; color: #445; }
+.kp-img { max-width: 100%; border: 1px solid #ccd; display: none; }
