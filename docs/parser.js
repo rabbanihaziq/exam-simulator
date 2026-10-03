@@ -84,6 +84,15 @@ function correctLetter(text) {
   return m ? m[1] : null;
 }
 
+/* The key line itself, as printed, so the app can show where a letter came
+   from: "Correct Answer: G." plus the rest of its line. */
+function keyLine(text) {
+  const m = text.match(CORRECT_ANSWER);
+  if (!m) return null;
+  const from = m.index + (/^[A-Za-z]/.test(m[0]) ? 0 : 1);
+  return text.slice(from).split("\n")[0].trim().slice(0, 160);
+}
+
 /* Dice coefficient over character bigrams — plays the role of Python's
    difflib ratio for stem matching (near-identical stems score ~0.9+,
    unrelated ones well under 0.4). */
@@ -1936,6 +1945,136 @@ function makeSource(doc, ocrPages) {
   };
 }
 
+/* ---------------- written answer keys ----------------------------------- */
+
+/* Not every form comes with NBME's own answer pages. Some are shared with a
+   key somebody wrote out: one continuous document, several items to a page,
+   no "Correct Answer:" anywhere, so the page index above finds nothing and
+   the whole form used to come back unscored --
+
+       1. A) Appropriate in view of the medical necessity to remove ...
+       6. C. The barium x-ray shows a stricture in the terminal ileum ...
+       14. E – Rhogam to prevent alloimmunization ...
+       23) Exocrine pancreatic insufficiency            (no letter at all)
+
+   tools/make_key_pdf.py rewrote such a list into one page per item before
+   upload; it is read here directly now. An item opens a line with its number,
+   and the letter has to stand alone: "7. Cholecystitis" is prose, and so is
+   "30) T lymphocytes", whose T is the first letter of the answer. */
+const WRITTEN_MARK = /^\s*(\d{1,3})\s*[.)]\s*(.*)$/;
+const WRITTEN_LETTER = /^([A-Z])(?:$|\s*[).:,;–—-]|\s+(?=[A-Z0-9(\[]))/;
+// / are Word's Symbol-font bullets, which come through unmapped
+const BULLETS = /[•·▪●]/g;
+
+/* Every numbered key line, then the longest run of them whose numbers rise in
+   reading order: a numbered list inside an explanation ("Tx: 1.) Propranolol")
+   or a stray number can only break into the run where it fits. A line that
+   names the answer without a letter is let in only as the item straight after
+   one already in the run, and only before the next one. Returns item number ->
+   { letter, answer, body, page, src }, where `answer` is the text after the
+   letter (or after the number, for a letterless line) and `body` the
+   explanation up to the next item. */
+function readWrittenKey(pageLines) {
+  const lines = [];
+  pageLines.forEach((ls, i) => ls.forEach((l) =>
+    lines.push({ p: i + 1, text: l.text.replace(/﻿/g, "").trim() })));
+  const marks = [];
+  lines.forEach((l, li) => {
+    const m = l.text.match(WRITTEN_MARK);
+    if (!m) return;
+    const num = parseInt(m[1], 10);
+    if (num < 1 || num > 200) return;
+    const lm = m[2].match(WRITTEN_LETTER);
+    marks.push({ li, num, letter: lm ? lm[1] : null, src: l.text,
+                 answer: (lm ? m[2].slice(lm[0].length) : m[2])
+                   .replace(/^[\s).:,;–—-]+/, "").trim() });
+  });
+
+  const lettered = marks.filter((k) => k.letter);
+  const len = [], prev = [];
+  let end = -1;
+  lettered.forEach((k, i) => {
+    len[i] = 1; prev[i] = -1;
+    for (let j = 0; j < i; j++) {
+      if (lettered[j].num < k.num && len[j] + 1 > len[i]) { len[i] = len[j] + 1; prev[i] = j; }
+    }
+    if (end < 0 || len[i] > len[end]) end = i;
+  });
+  const chain = [];
+  for (let i = end; i >= 0; i = prev[i]) chain.unshift(lettered[i]);
+
+  for (const k of marks) {
+    if (k.letter || !k.answer || chain.some((c) => c.num === k.num)) continue;
+    const at = chain.findIndex((c) => c.li > k.li);
+    const before = at < 0 ? chain[chain.length - 1] : chain[at - 1];
+    const after = at < 0 ? null : chain[at];
+    if (!(before ? before.num === k.num - 1 : k.num === 1)) continue;
+    if (after && after.num <= k.num) continue;
+    chain.splice(at < 0 ? chain.length : at, 0, k);
+  }
+
+  const key = new Map();
+  chain.forEach((k, i) => {
+    const stop = i + 1 < chain.length ? chain[i + 1].li : lines.length;
+    const body = [k.answer].concat(lines.slice(k.li + 1, stop).map((l) => l.text));
+    key.set(k.num, { num: k.num, letter: k.letter, answer: k.answer, body,
+                     page: lines[k.li].p, src: k.src });
+  });
+  return key;
+}
+
+/* An item's choices as text, read off the word boxes inside each choice row,
+   so it works the same for an item shown as text and one shown as an image. */
+function choiceTexts(choices, words) {
+  return choices.map((c) => {
+    const [x0, y0, x1, y1] = c.row;
+    const t = words.filter((w) => {
+      const cx = (w[0] + w[2]) / 2, cy = (w[1] + w[3]) / 2;
+      return cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+    }).map((w) => w[4]).join(" ");
+    return { letter: c.letter, text: t.replace(/^\S{0,3}[A-Z][.)]\s+/, "") };
+  });
+}
+
+/* The choice a written answer names, when it names one unambiguously. */
+function letterByText(answer, choices, words) {
+  const a = normText(answer);
+  if (a.length < 3) return null;
+  let best = null, bs = 0, second = 0;
+  for (const c of choiceTexts(choices, words)) {
+    const t = normText(c.text);
+    if (t.length < 3) continue;
+    // "Glucagonoma (not sure)" still names the choice "Glucagonoma"
+    const s = t === a ? 1 : (a.startsWith(t + " ") ? 0.95 : similarity(a, t));
+    if (s > bs) { second = bs; bs = s; best = c.letter; } else if (s > second) second = s;
+  }
+  return bs >= 0.8 && bs - second >= 0.15 ? best : null;
+}
+
+/* A written key's letter for one item. A letter the item has no choice for
+   is a slip ("25. P) Sinusitis" on a form whose item 25 runs A to F), and a
+   line with no letter at all still names the answer, so either is settled by
+   the answer text when it matches exactly one choice, and otherwise left
+   unkeyed rather than guessed. With no choices read, the letter stands. */
+function writtenLetter(k, choices, words) {
+  const letters = choices.map((c) => c.letter);
+  if (k.letter && (!letters.length || letters.includes(k.letter))) return k.letter;
+  return letters.length ? letterByText(k.answer, choices, words) : null;
+}
+
+/* The review panel for a written key: the letter, then the explanation, one
+   paragraph per bullet (the source wraps mid-sentence at the page width, so a
+   line break is not a paragraph). "REMOVED QUESTION" and "(not sure)" are
+   part of the text and stay in it. */
+function writtenInfo(k, letter) {
+  const flat = k.body.join(" ").replace(/\s+/g, " ").trim();
+  const paras = flat.split(/(?=[•·▪●])/)
+    .map((s) => s.replace(BULLETS, "•").trim())
+    .filter((s) => /[A-Za-z0-9]/.test(s));
+  if (!paras.length) return null;
+  return { paragraphs: [`Correct Answer: ${letter}.`].concat(paras) };
+}
+
 /* ---------------- main ------------------------------------------------- */
 
 async function parseExam(qBytes, aBytes, onProgress, opts) {
@@ -2000,6 +2139,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   const answerPages = [];
   const answerByItem = new Map();
   const groupLetter = new Map();
+  // "group:letter" -> the line the letter was read from, shown with the key
+  const keySource = new Map();
   aGroups.forEach((group, gi) => {
     for (const pno of group) {
       const text = aTexts[pno - 1];
@@ -2007,12 +2148,30 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       if (!letter) continue;   // continuation shot with no answer marker
       const cand = { group: gi, num: itemNumber(text), letter, key: stemKey(text) };
       answerPages.push(cand);
+      if (!keySource.has(`${gi}:${letter}`)) keySource.set(`${gi}:${letter}`, keyLine(text));
       if (!groupLetter.has(gi)) groupLetter.set(gi, letter);
       if (cand.num !== null && !answerByItem.has(cand.num)) {
         answerByItem.set(cand.num, cand);
       }
     }
   });
+
+  // A key with (almost) no answer pages may be a written list instead. It is
+  // read only then, and used only if it names more items than the pages did.
+  let written = null;
+  const writtenPage = new Map();          // key page -> its answer group
+  if (adoc && answerPages.length < Math.max(3, nq * 0.2)) {
+    const pl = [];
+    for (let i = 1; i <= na; i++) pl.push(await aSrc.lines(i));
+    const wk = readWrittenKey(pl);
+    if (wk.size >= Math.max(5, nq * 0.3, answerPages.length * 2)) written = wk;
+  }
+  // its answer-page image is the page the item's entry starts on
+  function writtenGroup(p) {
+    if (!writtenPage.has(p)) { writtenPage.set(p, aGroups.length); aGroups.push([p]); }
+    return writtenPage.get(p);
+  }
+  const writtenExpl = new Map();          // item index -> review panel
 
   function resolveAnswer(itemNo, qStem, gi, nq) {
     let bestGroup = null, bestLetter = null, bestRatio = 0;
@@ -2044,6 +2203,22 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       return [null, null];
     }
     return [bestGroup, bestLetter];
+  }
+
+  /* [answer group, letter, key line] for one item, from whichever kind of key
+     this is. idx is the item's index, for its written explanation. */
+  function keyFor(itemNo, qStem, gi, nq, choices, words, idx) {
+    if (written) {
+      const k = written.get(itemNo);
+      const letter = k ? writtenLetter(k, choices, words) : null;
+      if (!letter) return [null, null, null];
+      const info = writtenInfo(k, letter);
+      if (info) writtenExpl.set(idx, info);
+      const src = letter === k.letter ? k.src : `${k.src}  [${letter}: matched by answer text]`;
+      return [writtenGroup(k.page), letter, src];
+    }
+    const [g, letter] = resolveAnswer(itemNo, qStem, gi, nq);
+    return [g, letter, g === null ? null : (keySource.get(`${g}:${letter}`) || null)];
   }
 
   /* -- parse question pages -- */
@@ -2213,7 +2388,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
 
     // resolve against the answer key
     const qStem = stemKey(itemText);
-    const [aGroup, letter] = resolveAnswer(itemNo, qStem, gi, qGroups.length);
+    const [aGroup, letter, keySrc] = keyFor(itemNo, qStem, gi, qGroups.length,
+                                            choices, words, items.length);
 
     // structured real-text content; image mode is the fallback
     let content = null;
@@ -2248,6 +2424,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       a_group: aGroup,
       q_pages: group,
       a_pages: aGroup === null ? [] : aGroups[aGroup],
+      // the key line the letter was read from, as evidence for the reader
+      key_source: letter ? keySrc : null,
     });
   }
   prog("Done", 1);
@@ -2287,6 +2465,8 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   async function answerInfo(idx0) {
     const it = items[idx0];
     if (it.a_group === null || it.a_group === undefined) return null;
+    // a written key's page holds several items: each has its own entry
+    if (written) return writtenExpl.get(idx0) || null;
     if (aInfoCache.has(it.a_group)) return aInfoCache.get(it.a_group);
     let info = null;
     try {

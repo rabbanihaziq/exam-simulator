@@ -230,6 +230,7 @@ const items = await page.evaluate(() => window.DATA.items.map((it, i) => ({
   idx: i,
   item: it.item,
   correct: it.correct,
+  key_source: it.key_source,
   answer_available: it.answer_available,
   q_pages: it.q_pages,
   a_pages: it.a_pages,
