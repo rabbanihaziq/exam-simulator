@@ -92,6 +92,32 @@ function correctLetter(text) {
   return m ? m[1] : null;
 }
 
+/* When the key line itself is misread, the answer page still names every
+   wrong choice. Psychiatry 8's answer pages print the stem, the struck-out
+   choices, "Correct Answer: E." and a long explanation on one tall page, and
+   OCR lost the key line's first word ("Answer: C.", items 18 and 46), its
+   letter ("Correct Answer:", item 28) or its dot ("Correct Answer: FE", item
+   32) -- four items unkeyed. Each page also prints "Incorrect Answers: A, B,
+   D, E, and F.", and with the question's own choice count the one letter
+   missing from that list is the key. Returns the listed letters, or null. */
+function incorrectLetters(text) {
+  const m = text.match(/Incorrect\s*Answers?\s*[:.;]?\s*([^\n]*)/);
+  if (!m) return null;
+  const list = m[1].replace(/\band\b/g, ",").match(/^(?:[\s,;.&]*[A-Z](?![A-Za-z]))+/);
+  if (!list) return null;
+  const letters = list[0].match(/[A-Z]/g);
+  return letters && letters.length ? new Set(letters) : null;
+}
+
+/* The one choice letter, out of nChoices, that `excl` does not list. */
+function complementLetter(excl, nChoices) {
+  if (!excl || nChoices < 2) return null;
+  const all = Array.from({ length: nChoices }, (_, i) => String.fromCharCode(65 + i));
+  if ([...excl].some((L) => !all.includes(L))) return null;
+  const rest = all.filter((L) => !excl.has(L));
+  return rest.length === 1 ? rest[0] : null;
+}
+
 /* Dice coefficient over character bigrams — plays the role of Python's
    difflib ratio for stem matching (near-identical stems score ~0.9+,
    unrelated ones well under 0.4). */
@@ -2524,14 +2550,17 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
   const answerPages = [];
   const answerByItem = new Map();
   const groupLetter = new Map();
+  const groupExcl = new Map();   // see incorrectLetters
   aGroups.forEach((group, gi) => {
     for (const pno of group) {
       const text = aTexts[pno - 1];
       const letter = correctLetter(text);
-      if (!letter) continue;   // continuation shot with no answer marker
+      const excl = letter ? null : incorrectLetters(text);
+      if (!letter && !excl) continue;   // continuation shot with no answer marker
       const cand = { group: gi, num: itemNumber(text), letter, key: stemKey(text) };
       answerPages.push(cand);
-      if (!groupLetter.has(gi)) groupLetter.set(gi, letter);
+      if (excl) { if (!groupExcl.has(gi)) groupExcl.set(gi, excl); }
+      else if (!groupLetter.has(gi)) groupLetter.set(gi, letter);
       if (cand.num !== null && !answerByItem.has(cand.num)) {
         answerByItem.set(cand.num, cand);
       }
@@ -2565,6 +2594,9 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
       // "Invert / Contrast / Zoom" chrome in front of it (items 12, 18), and
       // four items came out unkeyed while the key sat on the facing page.
       if (aGroups.length === nq && groupLetter.has(gi)) return [gi, groupLetter.get(gi)];
+      // (a page whose key line was lost names its wrong choices instead; the
+      // caller works the letter out from them)
+      if (aGroups.length === nq && groupExcl.has(gi)) return [gi, null];
       return [null, null];
     }
     return [bestGroup, bestLetter];
@@ -2750,7 +2782,11 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
 
     // resolve against the answer key
     const qStem = stemKey(itemText);
-    const [aGroup, letter] = resolveAnswer(itemNo, qStem, gi, qGroups.length);
+    let [aGroup, letter] = resolveAnswer(itemNo, qStem, gi, qGroups.length);
+    if (aGroup !== null && !letter && groupExcl.has(aGroup)) {
+      letter = complementLetter(groupExcl.get(aGroup), ordered.length);
+      if (!letter) aGroup = null;
+    }
 
     // structured real-text content; image mode is the fallback
     let content = null;
