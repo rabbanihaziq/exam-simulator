@@ -1945,6 +1945,76 @@ function makeSource(doc, ocrPages) {
   };
 }
 
+/* ---------------- highlighted answer keys ------------------------------- */
+
+/* An older NBME review screen prints no "Correct Answer:" line at all: the
+   item is shown again with its correct choice painted yellow and the
+   explanation in blue under the choices (Internal Medicine Form 6's key, 0 of
+   50 keyed while every page sat there with a text layer). The letter is the
+   choice row under the highlight. Only asked of a key whose pages name no
+   letter in text, and only taken when exactly one choice row is lit.
+
+   The lit row's own label is the one most often misread, since its text was
+   recognized off a yellow background ("A}" on item 44, a bare "F" on item 17),
+   so the row is found by its paint and the letter counted from the labels
+   around it: one row pitch below E is F whatever its label came back as. */
+function isHighlight(d, i) {
+  return d[i] >= 215 && d[i + 1] >= 205 && d[i + 2] <= 120;
+}
+
+function highlightedChoice(img, w, h, words) {
+  const labels = [];
+  for (const wd of words) {
+    const m = wd.text.match(/^[O0Qo\u00a9\u00ae\u2022(\[]{0,2}([A-Z])[.)]$/);
+    if (m) labels.push({ L: m[1], x0: wd.x0, y: (wd.y0 + wd.y1) / 2, lh: wd.y1 - wd.y0 });
+  }
+  if (labels.length < 2) return null;
+  // the label column: the left edge most labels share
+  let col = null, best = 0;
+  for (const a of labels) {
+    const n = labels.filter((b) => Math.abs(b.x0 - a.x0) <= a.lh).length;
+    if (n > best) { best = n; col = a; }
+  }
+  const run = labels.filter((b) => Math.abs(b.x0 - col.x0) <= col.lh)
+                    .sort((a, b) => a.y - b.y);
+  if (run.length < 2) return null;
+  const lh = median(run.map((b) => b.lh));
+  const steps = [];
+  for (let i = 1; i < run.length; i++) {
+    const dl = run[i].L.charCodeAt(0) - run[i - 1].L.charCodeAt(0);
+    if (dl > 0) steps.push((run[i].y - run[i - 1].y) / dl);
+  }
+  const pitch = median(steps);
+  if (!(pitch > lh)) return null;
+
+  // horizontal bands of highlight that start at the label column
+  const x0 = Math.max(0, Math.round(col.x0 - lh * 2));
+  const bands = [];
+  let cur = null;
+  for (let y = 0; y < h; y++) {
+    let n = 0, first = -1;
+    for (let x = x0; x < w; x++) {
+      if (isHighlight(img.data, (y * w + x) * 4)) { n++; if (first < 0) first = x; }
+    }
+    if (n >= lh * 1.5 && first <= col.x0 + lh) {
+      if (cur && y === cur.y1 + 1) cur.y1 = y;
+      else { cur = { y0: y, y1: y }; bands.push(cur); }
+    }
+  }
+  const lit = bands.filter((b) => b.y1 - b.y0 + 1 >= lh * 0.5);
+  if (lit.length !== 1) return null;
+  const yc = (lit[0].y0 + lit[0].y1) / 2;
+  let near = run[0];
+  for (const b of run) if (Math.abs(b.y - yc) < Math.abs(near.y - yc)) near = b;
+  const k = Math.round((yc - near.y) / pitch);
+  if (Math.abs(yc - near.y - k * pitch) > pitch * 0.3 || Math.abs(k) > 3) return null;
+  const code = near.L.charCodeAt(0) + k;
+  if (code < 65 || code > 90) return null;
+  const text = words.filter((o) => o.y0 < lit[0].y1 && o.y1 > lit[0].y0 && o.x0 >= col.x0 - lh)
+                    .sort((a, b) => a.x0 - b.x0).map((o) => o.text).join(" ");
+  return { letter: String.fromCharCode(code), text };
+}
+
 /* ---------------- written answer keys ----------------------------------- */
 
 /* Not every form comes with NBME's own answer pages. Some are shared with a
@@ -2165,6 +2235,36 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     for (let i = 1; i <= na; i++) pl.push(await aSrc.lines(i));
     const wk = readWrittenKey(pl);
     if (wk.size >= Math.max(5, nq * 0.3, answerPages.length * 2)) written = wk;
+  }
+  // ...or the review screen that marks the answer by highlighting its choice
+  if (adoc && !written && answerPages.length < Math.max(3, nq * 0.2)) {
+    for (let gi = 0; gi < aGroups.length; gi++) {
+      for (const pno of aGroups[gi]) {
+        const text = aTexts[pno - 1];
+        if (correctLetter(text)) continue;
+        prog(`Reading answer key…`, 0.25 * gi / aGroups.length);
+        const page = await adoc.getPage(pno);
+        const vp0 = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: Math.min(1, 1100 / vp0.width) });
+        const c = document.createElement("canvas");
+        c.width = Math.round(viewport.width);
+        c.height = Math.round(viewport.height);
+        const cx = c.getContext("2d", { willReadFrequently: true });
+        await renderPage(page, viewport, cx);
+        const im = cx.getImageData(0, 0, c.width, c.height);
+        c.width = c.height = 1;
+        const hit = highlightedChoice(im, im.width, im.height,
+                                      await aSrc.words(pno, viewport));
+        if (!hit) continue;
+        const cand = { group: gi, num: itemNumber(text), letter: hit.letter,
+                       key: stemKey(text) };
+        answerPages.push(cand);
+        keySource.set(`${gi}:${hit.letter}`, `highlighted choice: ${hit.text}`.slice(0, 160));
+        if (!groupLetter.has(gi)) groupLetter.set(gi, hit.letter);
+        if (cand.num !== null && !answerByItem.has(cand.num)) answerByItem.set(cand.num, cand);
+        break;
+      }
+    }
   }
   // its answer-page image is the page the item's entry starts on
   function writtenGroup(p) {
