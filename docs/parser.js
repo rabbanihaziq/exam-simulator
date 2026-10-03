@@ -7,6 +7,11 @@
    data shape the Flask /api/exam endpoint served, plus:
      - qURLs[i]      : blob URL of the cropped question-page image
      - answerURL(i)  : lazy blob URL of the full answer-key page image
+     - declaredTotal : the "of N" the question headers print, or null; more
+                       than `count` means the share is missing pages
+     - answerPageCount, answerPageImage(k) : any answer-key page by 0-based
+                       index, rendered on demand to a PNG data URL, so a key
+                       that did not match its items can still be browsed
 
    A PDF that is one screenshot per page with no text layer is recognized here
    with tesseract.js, fetched from a CDN only when such a document is detected
@@ -2850,7 +2855,37 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     return info;
   }
 
+  /* -- any answer-key page, by index --
+     For browsing the key when an item's answer was not matched to it (or to
+     check one that was): page `idx0` (0-based, < answerPageCount) rendered
+     whole, as a PNG data URL. Rendered on first request only, then cached;
+     null for an index out of range or a page that will not render. */
+  const aPageCache = new Map();
+  async function answerPageImage(idx0) {
+    if (!adoc || !(idx0 >= 0 && idx0 < na)) return null;
+    if (!aPageCache.has(idx0)) {
+      aPageCache.set(idx0, (async () => {
+        try {
+          const page = await adoc.getPage(idx0 + 1);
+          const viewport = page.getViewport({ scale: SCALE });
+          const c = document.createElement("canvas");
+          c.width = Math.round(viewport.width);
+          c.height = Math.round(viewport.height);
+          await renderPage(page, viewport, c.getContext("2d"));
+          const url = c.toDataURL("image/png");
+          c.width = c.height = 1;
+          return url;
+        } catch (e) { return null; }
+      })());
+    }
+    return aPageCache.get(idx0);
+  }
+
+  // declaredTotal: the "of N" in the page headers (null when they print
+  // none), so the UI can tell a form that lost a page (Psychiatry Form 1
+  // has no items 1 and 2) from one that is simply shorter.
   return { count: items.length, title, items, qURLs, answerURL, answerInfo,
+           declaredTotal: ident.total, answerPageCount: na, answerPageImage,
            ocr: ocrStats, bandFallback };
 }
 
