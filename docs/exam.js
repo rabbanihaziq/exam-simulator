@@ -747,7 +747,24 @@ function renderQuestionHtml(it, container, review) {
         `style="width:${(b.wf * 100).toFixed(2)}%;margin-left:${(b.x0f * 100).toFixed(2)}%">`;
     }
   });
-  html += `<div class="copts">` + it.content.choices.map((c) => {
+  // choices set out as table rows: a heading row over the columns, and each
+  // choice's text split into cells of fixed width so the columns line up
+  const tab = it.content.table;
+  const cellsHtml = (cells) => cells.map((runs, j) =>
+    `<span class="tcell${tab.center[j] ? " tc" : ""}" style="width:${tab.w[j]}em;` +
+    `padding-left:${tab.pad[j]}em">${renderRuns(runs, hlSet)}</span>`).join("");
+  html += `<div class="copts${tab ? " tab" : ""}">`;
+  if (tab && (tab.head || tab.headImg)) {
+    const headHtml = tab.headImg
+      ? tab.headImg.map((h, j) => `<span class="tcell" style="width:${tab.w[j]}em">` +
+          `<img class="theadimg" src="${h.url}" style="height:${(h.h * 1.45).toFixed(2)}em"></span>`).join("")
+      : cellsHtml(tab.head);
+    html += `<div class="chead">` + (review ? `<span class="cmark"></span>` : "") +
+      `<span class="cradio"></span><span class="cbody"><span class="clab">A.</span> ` +
+      `<span class="ctext">${headHtml}</span></span>` +
+      (review ? "" : `<span class="cstrike">ab</span>`) + `</div>`;
+  }
+  html += it.content.choices.map((c) => {
     const cls = ["copt"];
     if (your === c.letter) cls.push("sel");
     if (S.struck[it.item] && S.struck[it.item][c.letter]) cls.push("struck");
@@ -759,7 +776,7 @@ function renderQuestionHtml(it, container, review) {
       (review ? `<span class="cmark"></span>` : "") +
       `<span class="cradio"><span class="cdot"></span></span>` +
       `<span class="cbody"><span class="clab">${c.letter}.</span> ` +
-      `<span class="ctext">${renderRuns(c.runs, hlSet)}</span></span>` +
+      `<span class="ctext">${tab && c.cells ? cellsHtml(c.cells) : renderRuns(c.runs, hlSet)}</span></span>` +
       (review ? "" : `<span class="cstrike" title="Cross out this option">ab</span>`) +
       `</div>`;
   }).join("") + `</div>`;
@@ -1792,7 +1809,10 @@ async function buildExport(includeExpl, onProgress) {
     if (it.page_item !== it.item) rec.page_item = it.page_item;
     if (it.content) {
       rec.stem = it.content.blocks.filter((b) => b.t === "p").map((b) => runsText(b.runs)).join("\n");
-      rec.choices = it.content.choices.map((c) => ({ letter: c.letter, text: runsText(c.runs) }));
+      const tab = it.content.table;
+      rec.choices = it.content.choices.map((c) => ({ letter: c.letter,
+        text: tab && c.cells ? c.cells.map(runsText).join(" | ") : runsText(c.runs) }));
+      if (tab && tab.headText) rec.choice_columns = tab.headText.map(runsText);
     }
     if (includeExpl && it.answer_available && DATA.answerInfo) {
       if (onProgress) onProgress(`Reading answer-key page for item ${it.item}… (${i + 1}/${DATA.items.length})`);
@@ -1847,6 +1867,7 @@ async function buildExport(includeExpl, onProgress) {
       md.push(`### Item ${r.item} — ${mark[r.result]} (yours ${r.your || "—"}, key ${r.correct || "—"})` +
         (r.marked ? " · marked" : ""));
       if (r.stem) md.push(r.stem);
+      if (r.choice_columns) md.push(`Columns: ${r.choice_columns.join(" | ")}`);
       if (r.choices) r.choices.forEach((c) => md.push(`- ${c.letter}. ${c.text}`));
       if (r.explanation) { md.push(""); md.push("**Answer key:** " + r.explanation.join("\n\n")); }
     });

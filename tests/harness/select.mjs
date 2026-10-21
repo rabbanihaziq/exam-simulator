@@ -65,6 +65,8 @@ await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
 
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: true,
+  // HARNESS_PROFILE reuses a profile so an image-only PDF's OCR comes from cache
+  ...(process.env.HARNESS_PROFILE ? { userDataDir: process.env.HARNESS_PROFILE } : {}),
   // an image-only PDF is OCR'd in the page; that one evaluate() call runs for
   // minutes and the 180s default protocol timeout would kill the run
   protocolTimeout: 0,
@@ -228,6 +230,22 @@ for (const p of parsed) {
 }
 
 for (const l of logs) if (/pageerror/i.test(l)) console.log("console " + l);
+// HARNESS_SHOT=<dir>: save how each tested item looks in text mode, after the
+// clicks (so the last choice shows as selected)
+if (process.env.HARNESS_SHOT) {
+  fs.mkdirSync(process.env.HARNESS_SHOT, { recursive: true });
+  for (const p of parsed) {
+    if (p.idx < 0) continue;
+    await page.evaluate((idx) => {
+      const it = window.__data.items[idx];
+      if (it.__saved !== undefined) it.content = it.__saved;
+      window.showItem(idx);
+    }, p.idx);
+    await sleep(400);
+    const el = await page.$("#qhtml");
+    if (el) await el.screenshot({ path: path.join(process.env.HARNESS_SHOT, `item${p.item}.png`) });
+  }
+}
 await browser.close();
 server.close();
 console.log(fails.length ? `\n${fails.length} failure(s)` : "\nall selection cases pass");

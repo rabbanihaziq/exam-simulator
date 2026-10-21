@@ -1063,9 +1063,14 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
   // assemble blocks in reading order, assigning word ids for highlighting
   let wid = 0;
   const blocks = [];
+  const wordOf = new Map();   // run -> its word, for pulling a table header back out
   for (const p of paras.filter((p) => !p.consumed)) {
     const runs = [];
-    p.lines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
+    p.lines.forEach((l) => l.words.forEach((w) => {
+      const r = wordRun(w, wid++);
+      wordOf.set(r, w);
+      runs.push(r);
+    }));
     if (runs.length) blocks.push({ t: "p", y: p.y0, runs });
   }
   // Crop with a 6px margin, clamped to the content area: at 2px a thin table
@@ -1187,10 +1192,220 @@ async function buildItemContent(raw, pxChoices, top, cw, ch, canvas, imgData,
       cLines = kept;
     }
     const runs = [];
-    cLines.forEach((l) => l.words.forEach((w) => runs.push(wordRun(w, wid++))));
-    choices.push({ letter: pc.letter, runs });
+    const words = [];
+    cLines.forEach((l) => l.words.forEach((w) => { runs.push(wordRun(w, wid++)); words.push(w); }));
+    choices.push({ letter: pc.letter, runs, nLines: cLines.length, words });
   }
-  return { blocks, choices };
+  // every stem line, including words dropped above as islands inside an ink
+  // region: a heading's superscript ("Na+") can make it look like one
+  const table = await choiceTable(choices, pxChoices, clusterTextLines(stemWords), blocks, wordOf,
+                                  stemBot, () => wid++, canvas, imgData);
+  choices.forEach((c) => { delete c.nLines; delete c.words; });
+  if (!table) return { blocks, choices };
+  return { blocks: table.blocks, choices, table: table.table };
+}
+
+/* Choices laid out as rows of a table, under column headings printed above
+   choice A:
+
+        Pulmonary Capillary   Left Atrial   Left Ventricular
+        Wedge Pressure        Pressure      End-diastolic Pressure
+     A. Increased             increased     increased
+     B. Increased             increased     normal
+
+   Read as prose, each row collapses to "Increased increased normal" and the
+   headings land in the stem (or get cropped as a stray picture), so nothing
+   says which value goes with which column. The pattern: every choice is one
+   line that splits at wide gaps into the same number of cells, and the cells
+   line up down the rows. The heading is the run of lines directly above
+   choice A that start right of the choice labels; its words go to the column
+   they sit over. Returns null whenever any of that doesn't hold, which leaves
+   the item exactly as it was. */
+const TABLE_EM_PER_LH = 1.45;   // heading picture scale: em per page line height
+async function choiceTable(choices, pxChoices, lines, blocks, wordOf, stemBot, nextWid, canvas,
+                           imgData) {
+  if (choices.length < 3 || choices.some((c) => c.nLines !== 1)) return null;
+  const hs = choices.flatMap((c) => c.words.map((w) => w.y1 - w.y0));
+  const lh = median(hs) || 20;
+  const labelX = Math.min(...pxChoices.map((p) => p.lx0));
+  if (pxChoices.some((p) => p.lx0 - labelX > lh * 2)) return null;   // two columns of choices
+
+  const splitCells = (ws, gap) => {
+    const cells = [];
+    ws.slice().sort((a, b) => a.x0 - b.x0).forEach((w) => {
+      const cur = cells[cells.length - 1];
+      if (cur && w.x0 - cur.x1 <= gap) { cur.words.push(w); cur.x1 = Math.max(cur.x1, w.x1); }
+      else cells.push({ words: [w], x0: w.x0, x1: w.x1 });
+    });
+    return cells;
+  };
+  const rows = choices.map((c) => splitCells(c.words, lh * 1.5));
+  const k = rows[0].length;
+  if (k < 2 || rows.some((r) => r.length !== k)) return null;
+  const tol = lh * 1.5;
+  const spread = (a) => Math.max(...a) - Math.min(...a);
+  for (let j = 0; j < k; j++) {
+    const x0s = rows.map((r) => r[j].x0), x1s = rows.map((r) => r[j].x1);
+    const cs = rows.map((r) => (r[j].x0 + r[j].x1) / 2);
+    if (spread(x0s) > tol && spread(x1s) > tol && spread(cs) > tol) return null;
+    if (j && Math.max(...rows.map((r) => r[j - 1].x1)) >= Math.min(...x0s)) return null;
+  }
+  const colX0 = [...Array(k).keys()].map((j) => Math.min(...rows.map((r) => r[j].x0)));
+  const colX1 = [...Array(k).keys()].map((j) => Math.max(...rows.map((r) => r[j].x1)));
+
+  // the heading: consecutive lines just above choice A, right of the labels
+  const firstBase = Math.min(...pxChoices.map((p) => p.base));
+  const rowPitch = (Math.max(...pxChoices.map((p) => p.base)) - firstBase) / (pxChoices.length - 1);
+  const above = lines.filter((L) => L.base < firstBase - lh * 0.5).sort((a, b) => b.base - a.base);
+  const prose = lines.filter((L) => L.words.length >= 8);
+  // the usual start of a stem line: not the leftmost, since the first line's
+  // item number ("45.") hangs out left of the rest
+  const stemMargin = prose.length ? median(prose.map((L) => L.x0)) : -Infinity;
+  const head = [];
+  let prev = firstBase;
+  for (const L of above) {
+    if (head.length >= 4) break;
+    if (prev - L.base > Math.max(rowPitch, lh * 1.6) * 1.8) break;
+    // Stem prose starts left of the labels, or at least well left of the
+    // first column (a heading centred over a narrow column starts a little
+    // left of it), and never runs far past the last one.
+    // (a wide heading centred over a narrow column can start well left of
+    // it, but never back at the stem's own margin)
+    if (L.x0 < labelX + lh * 0.5 || (L.x0 < colX0[0] - lh * 3 && L.x0 < stemMargin + lh)) break;
+    if (L.x1 > colX1[k - 1] + lh * 8) break;
+    head.push(L);
+    prev = L.base;
+  }
+  head.reverse();
+  const headWords = new Set(head.flatMap((L) => L.words));
+  const tableX1 = colX1[k - 1];
+  const rowsTop = Math.min(...pxChoices.map((p) => p.rowTop));
+  const rowsBot = Math.max(...pxChoices.map((p) => p.rowBot));
+  // the strip each column owns, split halfway between neighbouring columns
+  const zone = (j, x0, x1) => [j ? (colX1[j - 1] + colX0[j]) / 2 : x0,
+                               j < k - 1 ? (colX1[j] + colX0[j + 1]) / 2 : x1];
+  const newBlocks = [];
+  const headCrops = [];
+  {
+    const hy0 = head.length ? Math.min(...head.map((L) => L.y0)) : stemBot;
+    const hy1 = head.length ? Math.max(...head.map((L) => L.y1)) : stemBot;
+    for (const b of blocks) {
+      if (b.t === "img") {
+        const [bx0, by0, bx1, by1] = b.px;
+        // a crop lying over the table's own rows repeats them as a picture
+        const ov = Math.min(bx1, tableX1) - Math.max(bx0, labelX);
+        if (ov > (bx1 - bx0) * 0.5 && (by0 + by1) / 2 > rowsTop && (by0 + by1) / 2 < rowsBot) continue;
+        if (by1 <= hy0 - 2 || by0 >= stemBot + lh) { newBlocks.push(b); continue; }
+        // a crop of the heading alone goes; one that also holds an exhibit stays
+        // whole, and then so does the item
+        if (by0 >= hy0 - lh * 2 && by1 <= Math.max(hy1, stemBot) + lh) { headCrops.push(b.px); continue; }
+        return null;
+      }
+      const runs = b.runs.filter((r) => !headWords.has(wordOf.get(r)));
+      if (runs.length) newBlocks.push(runs.length === b.runs.length ? b : { ...b, runs });
+    }
+  }
+  // The heading is shown as the page's own pixels, cut into one piece per
+  // column. OCR reads headings worst of anything on the page: it drops words
+  // outright (Pediatrics 7 item 33 kept only "HCO3- (mEq/L)" of four
+  // headings), loses subscripts and splits two-line headings across columns.
+  // A picture is always right. Each cut goes through the widest blank strip
+  // between two columns, so no heading word is sliced. The heading's text, as
+  // far as OCR got it, is still kept for the results export.
+  const lab0 = Math.min(...pxChoices.map((p) => p.lw.y0));
+  const hBoxes = head.map((L) => [L.x0, L.y0, L.x1, L.y1]).concat(headCrops);
+  let headImg = null, cuts = null;
+  if (hBoxes.length && imgData) {
+    const y0 = Math.max(0, Math.min(...hBoxes.map((b) => b[1])) - 3);
+    const y1 = Math.min(lab0 - 1, Math.max(...hBoxes.map((b) => b[3])) + 3);
+    const W = imgData.width, data = imgData.data;
+    const blank = (x) => {
+      for (let y = Math.round(y0); y <= y1; y++) {
+        const i = (y * W + x) * 4;
+        if (Math.max(255 - data[i], 255 - data[i + 1], 255 - data[i + 2]) > 40) return false;
+      }
+      return true;
+    };
+    const left = Math.max(labelX, Math.min(colX0[0], ...hBoxes.map((b) => b[0])) - 4);
+    const right = Math.min(W - 1, Math.max(colX1[k - 1], ...hBoxes.map((b) => b[2])) + 4);
+    cuts = [left];
+    for (let j = 0; j < k - 1; j++) {
+      // the widest blank run between the two columns (between their centres
+      // if the heading is wider than the gap between their cells)
+      const best = (a, b) => {
+        let run = null, top = null;
+        for (let x = Math.round(a); x <= Math.round(b); x++) {
+          if (blank(x)) { run = run ? [run[0], x] : [x, x]; if (!top || run[1] - run[0] > top[1] - top[0]) top = run; }
+          else run = null;
+        }
+        return top;
+      };
+      const r = best(colX1[j] + 1, colX0[j + 1] - 1) ||
+                best((colX0[j] + colX1[j]) / 2, (colX0[j + 1] + colX1[j + 1]) / 2);
+      cuts.push(r ? (r[0] + r[1]) / 2 : (colX1[j] + colX0[j + 1]) / 2);
+    }
+    cuts.push(right);
+    if (cuts.some((c, i) => i && c <= cuts[i - 1])) cuts = null;
+    else {
+      headImg = [];
+      for (let j = 0; j < k; j++) {
+        headImg.push({ url: await cropBlob(canvas, cuts[j], y0, cuts[j + 1], y1),
+                       h: +((y1 - y0) / lh).toFixed(3),
+                       px: [Math.round(cuts[j]), Math.round(y0), Math.round(cuts[j + 1]), Math.round(y1)] });
+      }
+    }
+  }
+  // Each heading word goes to the column it sits over (nearest by distance to
+  // the column's span, then by centre): headings may be left-aligned or
+  // centred, and two columns' words can sit a single space apart.
+  const headRuns = colX0.map(() => []);
+  const headLineLen = colX0.map(() => 0);
+  for (const L of head) {
+    const perCol = colX0.map(() => []);
+    L.words.slice().sort((a, b) => a.x0 - b.x0).forEach((w) => {
+      const cx = (w.x0 + w.x1) / 2;
+      let best = 0, bd = Infinity;
+      for (let c = 0; c < k; c++) {
+        const d = Math.max(0, colX0[c] - cx, cx - colX1[c]) * 1000 +
+                  Math.abs(cx - (colX0[c] + colX1[c]) / 2);
+        if (d < bd) { bd = d; best = c; }
+      }
+      perCol[best].push(w);
+    });
+    perCol.forEach((ws, c) => {
+      headRuns[c].push(...ws.map((w) => wordRun(w, nextWid())));
+      headLineLen[c] = Math.max(headLineLen[c], ws.map((w) => w.text).join(" ").length);
+    });
+  }
+  choices.forEach((c, i) => {
+    const runOf = new Map(c.words.map((w, n) => [w, c.runs[n]]));
+    c.cells = rows[i].map((cell) => cell.words.map((w) => runOf.get(w)));
+  });
+  // A column the page centres (its cells' centres line up but their left
+  // edges don't: "4.2" over "4") is centred here too.
+  const center = [...Array(k).keys()].map((j) => {
+    const x0s = rows.map((r) => r[j].x0);
+    const cs = rows.map((r) => (r[j].x0 + r[j].x1) / 2);
+    return spread(x0s) > lh * 0.4 && spread(cs) < spread(x0s) * 0.6 ? 1 : 0;
+  });
+  // Column widths, in em. With a heading picture the table is the page's own
+  // geometry scaled (EM_PER_LH em to a line height, the scale the picture is
+  // drawn at), so each value sits under its piece of heading as it did on the
+  // page; a left-aligned column is padded in to where its cells start. Never
+  // narrower than the values need in the app's font, at about 0.56 em a
+  // character.
+  const need = [...Array(k).keys()].map((j) => (Math.max(
+    ...choices.map((c) => c.cells[j].map((r) => r.text).join(" ").length),
+    headImg ? 0 : headLineLen[j], 1) + 2) * 0.56);
+  const em = (px) => +(px / lh * TABLE_EM_PER_LH).toFixed(2);
+  const w = need.map((n, j) => cuts ? Math.max(n, em(cuts[j + 1] - cuts[j])) : +n.toFixed(2));
+  const pad = [...Array(k).keys()].map((j) =>
+    cuts && !center[j] ? Math.max(0, em(colX0[j] - cuts[j])) : 0);
+  const headText = head.length ? headRuns : null;
+  return {
+    blocks: newBlocks,
+    table: { w, pad, center, head: headImg ? null : headText, headText, headImg },
+  };
 }
 
 /* ---------------- multi-screenshot items -------------------------------- */
@@ -1246,8 +1461,9 @@ function choiceRun(raw, top, bottom, rx, lineInitial) {
     }
     // A label letter OCR reads as the digit it looks like. "0" for O was
     // always here; "1" for I turns up on Form 2's 20-option matching sets,
-    // where the run has to reach R and stops dead at the missing I.
-    const L = m[1] === "0" ? "O" : m[1] === "1" ? "I" : m[1];
+    // where the run has to reach R and stops dead at the missing I. "6" for G
+    // cost Pediatrics 7 item 21 its last three choices.
+    const L = { 0: "O", 1: "I", 6: "G" }[m[1]] || m[1];
     // an unticked radio circle read as part of the label — keep the right
     // edge, since the circle sits in the part being dropped, and remember the
     // token itself so the choice's own text can still exclude it
@@ -1472,7 +1688,19 @@ function tidyChoiceWords(raw) {
     const line = out.filter((o) => o !== wd && Math.abs(o.base - wd.base) <= lh * 0.5);
     if (line.some((o) => o.x0 > wd.x0)) continue;
     const left = line.filter((o) => o.x1 <= wd.x0 + 2).sort((a, b) => a.x0 - b.x0);
-    if (!left.some((o) => !labelish(o))) continue;
+    const text = left.filter((o) => !labelish(o));
+    if (!text.length) continue;
+    // A number closing a row of numbers, or a row already split into
+    // columns, is a table cell: the HCO3 column of an electrolyte panel lines
+    // up down the rows exactly like the button does. The button read as a
+    // digit ("Urine cytology 2") follows plain prose instead.
+    // Short words a table uses as values count too: Family Medicine 1 item
+    // 45's yes/no vaccine grid lost its whole third column to this.
+    const isNum = (t) => /^[<>+\-]?[\d.,]+%?$|^[\u2190-\u2193+\-\u2013\u2014]$/.test(t) ||
+                         /^(no|yes|nl|neg|pos|low|n\/a)$/i.test(t);
+    let split = false;
+    for (let i = 1; i < text.length; i++) if (text[i].x0 - text[i - 1].x1 > lh * 2) split = true;
+    if (isNum(wd.text) && (split || text.every((o) => isNum(o.text)))) continue;
     cands.push({ wd, lh, left });
   }
   const drop = new Set();
@@ -2060,7 +2288,7 @@ function overlapAgreement(a, b, d) {
 function shotHasChoices(s) {
   const strict = choiceRun(s.words, s.band[0], s.band[1], /^([A-Z0])\)$/, false);
   const loose = choiceRun(s.words, s.band[0], s.band[1],
-                          /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.,)]$/, true);
+                          /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z016])[.,)]$/, true);
   return Math.max(strict.length, loose.length) >= 2;
 }
 
@@ -3951,7 +4179,7 @@ async function parseExam(qBytes, aBytes, onProgress, opts) {
     // bracketed pass did.
     let ordered = choiceRun(rawWords, top, bottom, /^([A-Z0])\)$/, false);
     const loose = choiceRun(rawWords, top, bottom,
-                            /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z01])[.,)]$/, true);
+                            /^[O0QoCJ\u00a9\u00ae\u2022(\[]{0,2}([A-Z016])[.,)]$/, true);
     if (loose.length > ordered.length) ordered = loose;
 
     const choices = [];

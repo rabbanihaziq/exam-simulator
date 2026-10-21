@@ -71,6 +71,9 @@ const TEST_PAGE = `<!doctype html>
   .cradio { width:17px; height:17px; border:2px solid #556372; border-radius:50%;
             flex:none; margin-top:1px; background:#fff; }
   .clab { font-weight:600; flex:none; min-width:24px; }
+  .tcell { display:inline-block; vertical-align:top; padding-right:0.6em; box-sizing:border-box; }
+  .chead { font-weight:700; }
+  .chead .cradio, .chead .clab { visibility:hidden; }
   .w.i { font-style:italic; }
   .w.b { font-weight:700; }
   .imgmode { padding:20px 24px; color:#8b0000; font:600 14px Arial; }
@@ -109,9 +112,19 @@ window.__renderItemHtml = function (content) {
     else html += '<img class="qfig" src="' + b.url + '" style="width:' +
       (b.wf * 100).toFixed(2) + "%;margin-left:" + (b.x0f * 100).toFixed(2) + '%">';
   });
-  html += '<div class="copts">' + content.choices.map((c) =>
+  const tab = content.table;
+  const cells = (cs) => cs.map((r, j) => '<span class="tcell" style="width:' + tab.w[j] +
+    'em;padding-left:' + tab.pad[j] + 'em' + (tab.center[j] ? ';text-align:center' : '') + '">' +
+    renderRuns(r) + "</span>").join("");
+  html += '<div class="copts">';
+  if (tab && (tab.head || tab.headImg)) html += '<div class="copt chead"><span class="cradio"></span>' +
+    '<span class="clab">A)</span><span class="ctext">' + (tab.headImg
+      ? tab.headImg.map((h, j) => '<span class="tcell" style="width:' + tab.w[j] + 'em"><img src="' +
+          h.url + '" style="display:block;height:' + (h.h * 1.45).toFixed(2) + 'em"></span>').join("")
+      : cells(tab.head)) + "</span></div>";
+  html += content.choices.map((c) =>
     '<div class="copt"><span class="cradio"></span><span class="clab">' +
-    c.letter + ')</span><span class="ctext">' + renderRuns(c.runs) +
+    c.letter + ')</span><span class="ctext">' + (tab && c.cells ? cells(c.cells) : renderRuns(c.runs)) +
     "</span></div>").join("") + "</div>";
   return html;
 };
@@ -248,8 +261,12 @@ const items = await page.evaluate(() => window.DATA.items.map((it, i) => ({
     ? it.content.blocks.filter((b) => b.t === "p").map((b) => window.__runsText(b.runs))
     : null,
   choices: it.content
-    ? it.content.choices.map((c) => ({ letter: c.letter, text: window.__runsText(c.runs) }))
+    ? it.content.choices.map((c) => ({ letter: c.letter, text: c.cells
+        ? c.cells.map(window.__runsText).join(" | ") : window.__runsText(c.runs) }))
     : null,
+  table_head: it.content && it.content.table
+    ? (it.content.table.headText || []).map((r) => window.__runsText(r))
+      .concat(it.content.table.headImg ? ["<picture>"] : []) : undefined,
   figures: it.content
     ? it.content.blocks.filter((b) => b.t === "img").map((b) => ({
         y: Math.round(b.y), x0f: +b.x0f.toFixed(4), wf: +b.wf.toFixed(4),

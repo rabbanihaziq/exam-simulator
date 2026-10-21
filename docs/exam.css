@@ -194,6 +194,13 @@ body{
 .copt.struck .cstrike{color:#14385f;}
 .copt:hover{background:#f3f7fb;}
 .copt.struck:hover{background:#eef2f7;}
+/* choices laid out as table rows (see choiceTable in parser.js) */
+.copts.tab .clab{display:inline-block;min-width:1.5em;}
+.tcell{display:inline-block;vertical-align:top;padding-right:0.6em;box-sizing:border-box;}
+.chead{display:flex;align-items:flex-end;padding:4px 0 2px;font-weight:700;cursor:default;}
+.chead .cradio,.chead .clab,.chead .cstrike{visibility:hidden;}
+.theadimg{display:block;max-width:none;}
+.tcell.tc{text-align:center;}
 .cmark{width:24px;flex:none;display:flex;justify-content:center;margin-top:1px;}
 
 /* review states */
